@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+logs/
+posts/
+.lock_*
+.env
+*.log
