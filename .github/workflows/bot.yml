@@ -1,0 +1,63 @@
+name: Reddington Bot
+
+on:
+  schedule:
+    - cron: '0 4 * * 1-5'
+    - cron: '45 9 * * 1-5'
+    - cron: '15 11 * * 1-5'
+    - cron: '0 15 * * 0'
+    - cron: '*/10 * * * *'
+
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Setup env
+        run: |
+          echo "REDDINGTON_BOT_TOKEN=${{ secrets.REDDINGTON_BOT_TOKEN }}" >> $GITHUB_ENV
+          echo "REDDINGTON_CHANNEL_ID=${{ secrets.REDDINGTON_CHANNEL_ID }}" >> $GITHUB_ENV
+          echo "REDDINGTON_CHANNEL_NAME=Reddington Trade" >> $GITHUB_ENV
+
+      - name: Run job
+        env:
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          HOUR=$(date -u +%H)
+          MIN=$(date -u +%M)
+          WD=$(date -u +%u)
+          echo "UTC time: ${HOUR}:${MIN}, weekday: ${WD}"
+
+          JOB="alert_monitor"
+          if [ "$WD" -ge 1 ] && [ "$WD" -le 5 ]; then
+            if [ "$HOUR" = "04" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
+              JOB="morning_brief"
+            elif [ "$HOUR" = "09" ] && [ "$MIN" -ge "45" ] && [ "$MIN" -lt "55" ]; then
+              JOB="tiger_day"
+            elif [ "$HOUR" = "11" ] && [ "$MIN" -ge "15" ] && [ "$MIN" -lt "25" ]; then
+              JOB="asian_review"
+            fi
+          elif [ "$WD" = "7" ]; then
+            if [ "$HOUR" = "15" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
+              JOB="weekly_preview"
+            fi
+          fi
+
+          echo "running job: ${JOB}"
+          mkdir -p posts logs
+          python jobs/${JOB}.py 2>&1 | tee logs/${JOB}_run.log
