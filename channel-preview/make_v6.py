@@ -19,11 +19,14 @@ TEXT = '#b8a878'
 GRID = '#18161a'
 WATERMARK = '#2a2418'
 
-logo = Image.open('reddington_logo.jpg')
-w_l, h_l = logo.size
-r_crop = logo.crop((int(w_l*0.32), int(h_l*0.21), int(w_l*0.68), int(h_l*0.45)))
-r_resized = r_crop.resize((56, 56), Image.LANCZOS)
-r_arr = np.array(r_resized)
+try:
+    logo = Image.open('reddington_logo.jpg')
+    w_l, h_l = logo.size
+    r_crop = logo.crop((int(w_l*0.32), int(h_l*0.21), int(w_l*0.68), int(h_l*0.45)))
+    r_resized = r_crop.resize((56, 56), Image.LANCZOS)
+    r_arr = np.array(r_resized)
+except (FileNotFoundError, IOError):
+    r_arr = None
 
 
 def to_datetime(ts_ms):
@@ -156,10 +159,13 @@ def draw_tv_chart(ohlc, ticker, support_range, resistance_range, filename):
     fig.text(0.96, 0.045, date_range_str, fontsize=8, color=TEXT_DIM, ha='right', va='center')
     fig_w_in, fig_h_in = fig.get_size_inches()
     dpi = fig.dpi
-    margin_right = 24
-    margin_bottom = 22
-    fig.figimage(r_arr, xo=fig_w_in * dpi - r_resized.size[0] - margin_right,
-                 yo=margin_bottom, alpha=0.55, zorder=10)
+    margin_right = 16
+    margin_bottom = 14
+    if r_arr is not None:
+        fig.figimage(r_arr,
+                     xo=fig_w_in * dpi - r_resized.size[0] - margin_right,
+                     yo=margin_bottom,
+                     alpha=0.50, zorder=10)
     plt.savefig(filename, dpi=140, facecolor=BG)
     plt.close()
     print(f'saved {filename}')
