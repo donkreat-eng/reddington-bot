@@ -2,6 +2,7 @@
 import os
 import time
 import urllib.parse
+import json
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -42,15 +43,17 @@ def _api(method, **fields):
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
         with urlopen(req, timeout=30) as r:
-            import json
             return json.loads(r.read())
     except URLError as e:
         logger.error(f"API error {method}: {e}")
         return {"ok": False, "error": str(e)}
 
 
-def send_photo(photo_path, caption, parse_mode="HTML"):
-    result = _api("sendPhoto", chat_id=CHAT_ID, photo=photo_path, caption=caption, parse_mode=parse_mode)
+def send_photo(photo_path, caption, parse_mode="HTML", reply_markup=None):
+    fields = {"chat_id": CHAT_ID, "photo": photo_path, "caption": caption, "parse_mode": parse_mode}
+    if reply_markup is not None:
+        fields["reply_markup"] = reply_markup
+    result = _api("sendPhoto", **fields)
     if result.get("ok"):
         mid = result["result"]["message_id"]
         logger.info(f"  photo sent: message_id={mid}")
@@ -59,9 +62,17 @@ def send_photo(photo_path, caption, parse_mode="HTML"):
     return None
 
 
-def send_text(text, parse_mode="HTML", disable_notification=False):
-    result = _api("sendMessage", chat_id=CHAT_ID, text=text, parse_mode=parse_mode,
-                  disable_web_page_preview=True, disable_notification=disable_notification)
+def send_text(text, parse_mode="HTML", disable_notification=False, reply_markup=None):
+    fields = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+        "disable_notification": disable_notification,
+    }
+    if reply_markup is not None:
+        fields["reply_markup"] = reply_markup
+    result = _api("sendMessage", **fields)
     if result.get("ok"):
         mid = result["result"]["message_id"]
         logger.info(f"  text sent: message_id={mid}")
@@ -70,16 +81,51 @@ def send_text(text, parse_mode="HTML", disable_notification=False):
     return None
 
 
-def post_pair(photo_path, caption, body_text):
+def pin_message(message_id, disable_notification=False):
+    result = _api("pinChatMessage",
+                  chat_id=CHAT_ID,
+                  message_id=message_id,
+                  disable_notification=disable_notification)
+    if result.get("ok"):
+        logger.info(f"  message pinned: {message_id}")
+        return True
+    logger.error(f"  pin failed: {result}")
+    return False
+
+
+def url_button(text, url):
+    return json.dumps({
+        "inline_keyboard": [[{"text": text, "url": url}]]
+    })
+
+
+def post_pair(photo_path, caption, body_text, reply_markup=None):
     logger.info(f"publishing to channel {CHAT_ID}")
-    photo_mid = send_photo(photo_path, caption)
+    photo_mid = send_photo(photo_path, caption, reply_markup=reply_markup)
     time.sleep(1.0)
-    text_mid = send_text(body_text)
+    text_mid = send_text(body_text, reply_markup=reply_markup)
     return {"photo_id": photo_mid, "text_id": text_mid}
 
 
 def send_alert(text):
     return send_text(text, disable_notification=False)
+
+
+def post_donation_pinned(donate_url):
+    body = (
+        "💎 <b>Поддержать REDDINGTON</b>\n\n"
+        "Канал делается для вас и за ваши донаты. "
+        "Любая сумма помогает нам делать больше разборов, "
+        "улучшать бот и добавлять новые фичи.\n\n"
+        "🔗 Нажмите кнопку ниже — откроется безопасный "
+        "инвойс от @CryptoBot (BTC, ETH, TON, USDT и др.).\n\n"
+        "🙏 Спасибо за поддержку!"
+    )
+    markup = url_button("💸 Поддержать REDDINGTON", donate_url)
+    msg_id = send_text(body, reply_markup=markup)
+    if msg_id:
+        pin_message(msg_id, disable_notification=False)
+    return msg_id
 
 
 if __name__ == "__main__":
