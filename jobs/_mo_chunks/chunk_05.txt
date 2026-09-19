@@ -1,71 +1,47 @@
-            data, _ = await self.http.get_json(USD_RUB_SOURCE)
-        except RuntimeError as exc:
-            log.warning("fx: %s", exc)
-            return None
-        try:
-            rate = float(data["rates"]["RUB"])
-        except (KeyError, TypeError, ValueError):
-            log.warning("fx: malformed payload: %r", data)
-            return None
-        return rate
+    """Параллельный сбор по 4 источникам, потом простое большинство."""
+    crypto: dict[str, dict[str, dict]] = {src: {} for src in PRICE_SOURCES}
+    metals: dict[str, dict | None] = {}
 
+    def _bin() -> None:
+        crypto["binance"] = fetch_binance(BINANCE_SYMBOL)
 
-# --- Анти-спам / дельта ------------------------------------------------------
+    def _cg() -> None:
+        crypto["coingecko"] = fetch_coingecko(COINGECKO_IDS)
 
-class Dedupe:
-    """Не публикуем повторно, если цены не сдвинулись и прошло мало времени.
+    def _kr() -> None:
+        crypto["kraken"] = fetch_kraken(BINANCE_SYMBOL)
 
-    Состояние хранится в STATE_PATH (том же, что использует Scheduler).
-    """
+    def _cb() -> None:
+        crypto["coinbase"] = fetch_coinbase(BINANCE_SYMBOL)
 
-    def __init__(self, state_path: str) -> None:
-        self.path = state_path
-        self._cache: dict[str, Any] = self._load()
+    def _au() -> None:
+        metals["Gold"] = fetch_metal(METAL_SYMBOLS["Gold"])
 
-    def _load(self) -> dict[str, Any]:
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+    def _ag() -> None:
+        metals["Silver"] = fetch_metal(METAL_SYMBOLS["Silver"])
 
-    def _save(self) -> None:
-        tmp = f"{self.path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self._cache, f, ensure_ascii=False)
-        os.replace(tmp, self.path)
+    jobs = [_bin, _cg, _kr, _cb, _au, _ag]
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        list(pool.map(lambda f: f(), jobs))
 
-    def should_publish(self, prices: dict[str, VerifiedPrice]) -> bool:
-        last = self._cache.get("last_publish")
-        prev = self._cache.get("prices", {}) or {}
-        now_ts = time.time()
-
-        # 1) Сигнал по дельте: если хоть один актив сдвинулся выше порога — публикуем.
-        for sym, vp in prices.items():
-            old = prev.get(sym)
-            if old is None:
-                continue
-            try:
-                old_f = float(old)
-            except (TypeError, ValueError):
-                continue
-            delta_abs = abs(vp.usd - old_f)
-            threshold = ABS_PRICE_JUMP_USD_SMALL if sym in ("XRP", "BNB") else ABS_PRICE_JUMP_USD
-            if delta_abs >= threshold:
-                log.info("dedupe: %s moved %.4f >= %.2f → publish", sym, delta_abs, threshold)
-                return True
-            if old_f > 0:
-                delta_pct = abs(vp.usd - old_f) / old_f * 100.0
-                if delta_pct >= PCT_PRICE_JUMP:
-                    log.info("dedupe: %s moved %.2f%% ≥ %.2f%% → publish", sym, delta_pct, PCT_PRICE_JUMP)
-                    return True
-
-        # 2) Тихое окно: если движений нет, публикуем не чаще раза в QUIET_HOURS.
-        if isinstance(last, dict):
-            try:
-                last_ts = float(last.get("ts", 0))
-            except (TypeError, ValueError):
-                last_ts = 0.0
-            if last_ts and (now_ts - last_ts) < QUIET_HOURS * 3600:
-                log.info("dedupe: quiet window — skip (Δ=%.0fs)", now_ts - last_ts)
-                return False
+    prices: dict[str, dict] = {}
+    for tk in CRYPTO_TICKERS:
+        votes: list[tuple[float, float, float, str]] = []
+        for src, table in crypto.items():
+            row = table.get(tk)
+            if row and row.get("price"):
+                votes.append((row["price"], row["change_pct"],
+                              row["volume_24h"], row["source"]))
+        if not votes:
+            prices[tk] = {"price": 0.0, "change_pct": 0.0,
+                          "volume_24h": 0.0, "source": "none",
+                          "spread_pct": 0.0, "agree": 0}
+            continue
+        # медиана по цене
+        votes.sort(key=lambda v: v[0])
+        med_price = votes[len(votes) // 2][0]
+        # изменение — берём у источника, ближайшего к медиане
+        ref = min(votes, key=lambda v: abs(v[0] - med_price))
+        change_pct = ref[1]
+        vol = ref[2]
+        agree = sum(1 for v in votes if abs(v[0] - med_price
