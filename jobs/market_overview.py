@@ -1,9 +1,6 @@
 """13:30 YEKT market overview ‚Äî BTC/ETH/BNB/SOL/XRP + Gold/Silver —Å –ø–æ–∑–∏—Ü–∏–æ–Ω–Ω—ã–º —Å–ª–æ–µ–º.
 
-–ü–æ–ª–Ω–æ—Å—Ç—å—é –∞–≤—Ç–æ–Ω–æ–º–Ω—ã–π: 4 –∏—Å—Ç–æ—á–Ω–∏–∫–∞ —Ü–µ–Ω—ã, –≤–µ—Ä–∏—Ñ–∏–∫–∞—Ü–∏—è –ø–µ—Ä–µ–¥ –ø—É–±–ª–∏–∫–∞—Ü–∏–µ–π,
-–ø–µ—Ä–µ—Å–±–æ—Ä–∫–∞ –ø—Ä–∏ —Ä–∞—Å—Ö–æ–∂–¥–µ–Ω–∏–∏, retry 3√ó15 –º–∏–Ω –ø—Ä–∏ —Å–±–æ—è—Ö –¥–∞–Ω–Ω—ã—Ö.
-"""
-from __future__ import annotations
+–ü–æ–ª–Ω–æ—Å—Ç—å—é –∞–≤—Ç–æ–Ω–æ–º–Ω—ã–π: 4 –∏—Å—Ç–æ—á–Ω–∏–∫–∞ —Ü–µ–Ω—ã, –≤–µ—Ä–∏—Ñ–∏–∫–∞—Ü–∏—è + —Å–ø—Ä–µ–¥, retry 3‚Äì15 —Ä–∞–∑ –Ω–∞ –∏—Å—Ç–æ—á–Ω–∏–∫, —Ç–∏—Ö–∏–π —Ñ–æ–ª–ª–±—ç–∫, –ø–æ—Å—Ç —Ä–∞–∑ –≤ –¥–µ–Ω—å.
 
 import os
 import sys
@@ -20,21 +17,21 @@ from lib.common import load_env, log, post_dir, setup_logger  # noqa: E402
 from lib.post import fmt_price, fmt_change, fmt_volume  # noqa: E402
 from lib.publish import post_pair  # noqa: E402
 YEKT = ZoneInfo("Asia/Yekaterinburg")
-CRYPTO_TICKERS = ["BTD", "ETN", "BNB", "SOL", "XRP"]
+CRYPTO_TICKERS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
 BINANCE_SYMBOL = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT",
-                 "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
-METAL_SYMBOLS = {"Gold": "GC=F", "Silver": "SI?F"}
-COINGECK_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
+                  "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+METAL_SYMBOLS = {"Gold": "GC=F", "Silver": "SI=F"}
+COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
                  "SOL": "solana", "XRP": "ripple"}
 PRICE_SOURCES = ["binance", "coingecko", "kraken", "coinbase"]
 THROTTLE = {"binance": 0.25, "coingecko": 2.0, "kraken": 0.5, "coinbase": 0.5}
 BINANCE_BASE = "https://api.binance.com"
-COINGECK_BASE = "https://api.coingecko.com/api/v3"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 KRAKEN_BASE = "https://api.kraken.com/0/public"
 COINBASE_BASE = "https://api.coinbase.com/v2"
-BYBI_BASQ = "https://api.bybit.com/v5/market"
-KRAKEN_INTERVAL = {4 * 3600: 240}  # 4h interval in minutes for Kraken OHLC
-# Cache for Bybit tickers (single batch call is much cheaper than 5 separate calls
+BYBIT_BASE = "https://api.bybit.com/v5/market"
+KRAKEN_INTERVAL = {4 * 3600: 240}  # 4h interval in minutes for Kraken OI
+# Cache for Bybit tickers (single batch call is much cheaper than 5 separate calls)
 _BYBIT_CACHE: dict = {"ts": 0.0, "data": {}}
 _BYBIT_CACHE_TTL = 30.0  # seconds
 
@@ -48,7 +45,7 @@ def _binance_price(symbol: str) -> tuple[float, str]:
     return float(data["lastPrice"]), "binance"
 
 def _coingecko_price(coin_id: str) -> tuple[float, str]:
-    data = _http_json(f"{COINGECK_BASE}/simple/price",
+    data = _http_json(f"{COINGECKO_BASE}/simple/price",
                       {"ids": coin_id, "vs_currencies": "usd"})
     return float(data[coin_id]["usd"]), "coingecko"
 
@@ -80,32 +77,120 @@ def fetch_crypto_price(ticker: str) -> dict:
         try:
             time.sleep(THROTTLE[name])
             v, src = sources[name]()
-            results.append(( v, src))
+            results.append((v, src))
         except Exception as e:  # noqa: BLE001
             last_err = e
-            log("rf´ëï—}ΩŸï…Ÿ•ï‹à∞ÅòâÌ—•ç≠ï…ÙÅÌπÖµïÙÅ%0ËÅÌïÙà§(ÄÄÄÅ•òÅ±ï∏°…ïÕ’±—Ã§ÄÄ»Ë(ÄÄÄÄÄÄÄÅ…Ö•ÕîÅI’π—•µï……Ω»°òâÌ—•ç≠ï…ÙËÅΩπ±‰ÅÌ±ï∏°…ïÕ’±—Ã•ÙÅÕΩ’…çïÃÅ=,Ä°Ì±ÖÕ—}ï……Ù§à§(ÄÄÄÅ¡…•çïÃÄÙÅm¿ÅôΩ»Å¿∞Å|Å•∏Å…ïÕ’±—Õt(ÄÄÄÅ¡…•çïÕ}ÕΩ…—ïêÄÙÅÕΩ…—ïê°¡…•çïÃ§(ÄÄÄÅµïë•Ö∏ÄÙÅ¡…•çïÕ}ÕΩ…—ïëm±ï∏°¡…•çïÕ}ÕΩ…—ïê§ÄººÄ…t(ÄÄÄÅÕ¡…ïÖë}¡ç–ÄÙÄ°µÖ‡°¡…•çïÃ§Ä¥Åµ•∏°¡…•çïÃ§§ÄºÅµïë•Ö∏Ä®Äƒ¿¿(ÄÄÄÅ…ï—’…∏ÅÏ(ÄÄÄÄÄÄÄÄâ—•ç≠ï»àËÅ—•ç≠ï»∞(ÄÄÄÄÄÄÄÄâ¡…•çîàËÅµïë•Ö∏∞(ÄÄÄÄÄÄÄÄâÕ¡…ïÖë}¡ç–àËÅÕ¡…ïÖë}¡ç–∞(ÄÄÄÄÄÄÄÄâπ}ÕΩ’…çïÃàËÅ±ï∏°…ïÕ’±—Ã§∞(ÄÄÄÄÄÄÄÄâÕΩ’…çïÃàËÅ…ïÕ’±—Ã∞(ÄÄÄÅÙ()ëïòÅ}âÂâ•—}—•ç≠ï…Õ}çÖç°ïê†§Ä¥¯Åë•ç–Ë(ÄÄÄÄààâIï—…•ïÃÅÖ±∞Å	Ââ•–Å±•πïÖ»Å—•ç≠ï…ÃÅΩπçî∞ÅçÖç°îÅôΩ»ÄÃ¡Ã∏ààà(ÄÄÄÅπΩ‹ÄÙÅ—•µîπ—•µî†§(ÄÄÄÅ•òÅ}	e	%Q}!lâ—ÃâtÅÖπêÅπΩ‹Ä¥Å}	e	%}!lâ—ÃâtÄÅ}	e	%Q}!}QQ0Ë(ÄÄÄÄÄÄÄÅ…ï—’…∏Å}	e	%Q}!lùëÖ—Ñùt(ÄÄÄÅëÖ—ÑÄÙÅ}°——¡}©ÕΩ∏°òâÌ	e	%Q}	M≠ÙΩÿ‘Ω—•ç≠ï…Ãº»—°»à§(ÄÄÄÅ}	e	%Q}!lâ—ÃâtÄÙÅπΩ‹(ÄÄÄÅ}	e	%}!lùëÖ—ÑùtÄÙÅëÖ—Ñ(ÄÄÄÅ…ï—’…∏ÅëÖ—Ñ()ëïòÅâ’•±ë}çÖ¡—•Ω∏°¡…•çïÃËÅë•ç–∞Åç°ÖπùïÃËÅë•ç–∞Å—ÃËÅë•ç–§Ä¥¯ÅÕ—»Ë(ÄÄÄÄàäâ Updates the header in the post: ticker price and %change"""
-    partsional = {}
+            log("‚ö† –∏—Å—Ç–æ—á–Ω–∏–∫ %s —É–ø–∞–ª –ø–æ %s: %s ‚Äî –±–µ—Ä—ë–º –º–µ–¥–∏–∞–Ω—É –∏–∑ –æ—Å—Ç–∞–ª—å–Ω—ã—Ö",
+                name, ticker, e)
+    if not results:
+        raise RuntimeError(f"–≤—Å–µ –∏—Å—Ç–æ—á–Ω–∏–∫–∏ —É–ø–∞–ª–∏ –ø–æ {ticker}: {last_err}")
+    prices = [v for v, _ in results]
+    sources_used = [s for _, s in results]
+    median = sorted(prices)[len(prices) // 2]
+    spread = max(prices) - min(prices)
+    return {
+        "ticker": ticker,
+        "median": median,
+        "spread": spread,
+        "sources": sources_used,
+        "n": len(results),
+    }
+
+def fetch_crypto_oi(ticker: str) -> dict:
+    """Fetch crypto Open Interest + funding rate from Bybit for positional layer."""
+    symbol = BINANCE_SYMBOL[ticker]
+    ts_now = time.time()
+    if ts_now - _BYBIT_CACHE["ts"] > _BYBIT_CACHE_TTL:
+        data = _http_json(
+            f"{BYBIT_BASE}/tickers",
+            {"category": "linear"}
+        )
+        _BYBIT_CACHE["ts"] = ts_now
+        _BYBIT_CACHE["data"] = {
+            item["symbol"]: item for item in data["result"]["list"]
+            if item["symbol"].endswith("USDT")
+        }
+    item = _BYBIT_CACHE["data"].get(symbol)
+    if not item:
+        return {"ticker": ticker, "oi": 0.0, "funding": 0.0, "src": "missing"}
+    oi = float(item.get("openInterest", 0.0))
+    funding = float(item.get("fundingRate", 0.0)) * 100  # ‚Üí %
+    return {"ticker": ticker, "oi": oi, "funding": funding, "src": "bybit"}
+
+def _g_or_q(num: float) -> str:
+    """Abbreviate a large number: 1.2K, 3.4M, 5.6B."""
+    for unit in ("", "K", "M", "B"):
+        if abs(num) < 1000:
+            return f"{num:.1f}{unit}"
+        num /= 1000
+    return f"{num:.1f}T"
+
+def render_header(ticker: str, price: float, change: float, oi: float, funding: float) -> str:
+    """One-liner for a ticker."""
+    arrow = "üü¢" if change >= 0 else "üî¥"
+    base = f"{ticker} ${price:,.2f} ({change:+.2f}%) {arrow}"
+    if oi > 0:
+        base += f" ¬∑ OI {_g_or_q(oi)} ¬∑ funding {funding:+.3f}%"
+    return base
+
+def render_positional(prices: dict, changes: dict) -> str:
+    """Renders the 'positional' section - tickers with significant 4h moves."""
+    positional_ticker_changes = {}
     for t, p in prices.items():
-        line = f"{t}: {p}$".format((t=t.upper(), p=p.price))
+        line = f"{t}: {p}$".format(t=t.upper(), p=p.price)
         ch = changes.get(t, 0.0)
-        earliest = '‚Ää'‚Äã" if ch > 0 else '‚Üñ"
+        earliest = "‚è±" if ch > 0 else "‚è±"
         partial_ticker = {"line": line, "earliest": earliest, "change": ch}
-        if parsional_ticker.change in parssional_ticker_changes:
-            parsional_ticker.change in partsional_ticker_changes:
-            parsional_ticker["line"] = line
-            partsional_ticker["change"] = ch
-            partsional_ticker["earliest"] = earliest
-        elif partsional_ticker["change"] !== ch:
-            partsional_ticker["line"] = line
-            partsional_ticker["change"]: ch
-            partsional_ticker["earliest"] = earliest
-    return "\n".join(partsional_ticker_changes)
+        if partial_ticker.change in positional_ticker_changes:
+            positional_ticker_changes[partial_ticker.change]['line'] = line
+            positional_ticker_changes[partial_ticker.change]['change'] = ch
+            positional_ticker_changes[partial_ticker.change]['earliest'] = earliest
+        elif partial_ticker['change'] != ch:
+            partial_ticker['line'] = line
+            partial_ticker['change']: ch
+            partial_ticker['earliest'] = earliest
+    return "\n".join(positional_ticker_changes)
 
 def build_body(prices: dict, changes: dict, positional: dict, fng: dict, ts: dict) -> str:
     """Trends the fields into a post text about trends and Positionals."""
     lines = []
-    lines.append(f"‚ÄìBet postitions:)
-        postional.sorted(key=lambda h: h.get("ok",False), reverse=True)
-        ..items()
-        ..items()
-        .map(lambda c: f"‚öëÏÅÌ®πùï–†ùΩ¨ú•ıÌ(πùï–†ù¡ΩÃú∞úú•Ùà∞ÅÅµÖ…≠ï—}ΩŸï…Ÿ•ï›Ä∞Å§ı®πùï–†ù•êú§§(ÄÄÄÄÄÄÄÄ§(ÄÄÄÄ§(ÄÄÄÅ±•πïÃπÖ¡¡ïπê†àà§(ÄÄÄÅ±•πïÃπÖ¡¡ïπê†âQ…ïπëÃà§(ÄÄÄÅôΩ»Å–∞Å¿Å•∏Å¡…•çïÃπ•—ïµÃ†§Ë(ÄÄÄÄÄÄÄÅ±•πïÃπÖ¡¡ïπê°òàçÌ—ÙËÅÌ¡Ùêà§(ÄÄÄÅ±•πïÃπÖ¡¡ïπê†àà§(ÄÄÄÅ±•πïÃπÖ¡¡ïπê†âQïç°π•çÖ±Ãà§(ÄÄÄÅôΩ»Å–∞Å¿Å•∏Å¡ΩÕ—•ΩπÖ∞π•—ïµÃ†§Ë(ÄÄÄÄÄÄÄÅ±•πïÃπÖ¡¡ïπê°òàçÌ—ÙËÅÌ¡Ùêà§(ÄÄÄÅ±•πïÃπÖ¡¡ïπê†àà§(ÄÄÄÅ±•πïÃπÖ¡¡ïπê†âΩ…ïçÖÕ–à§(ÄÄÄÅôΩ»Å–∞Å¿Å•∏Åôπúπ•—ïµÃ†§Ë(ÄÄÄÄÄÄÄÅ±•πïÃπÖ¡¡ïπê°òààçÌ—ÙËÅÌ¡Ùêà§(ÄÄÄÅ…ï—’…∏Äâq∏àπ©Ω•∏°±•πïÃ§()ëïòÅ¡ΩÕ—}¡Ö•»°Õ—…}¡Ö—†∞ÅçÖ¡—•Ω∏ËÅÕ—»∞ÅâΩë‰ËÅÕ—»§Ë(ÄÄÄÅç°Ö…—}¡Ö—†ÄÙÅÕ—…}¡Ö—†πÕ—Ö–†§πÕ—}Õ•ÈïÙÄåÅπΩ≈ÑËÅƒÃ‹(ÄÄÄÅçÖ¡—•Ω∏ÄÙÅâ’•±ë}çÖ¡—•Ω∏°¡…•çïÃ∞Åç°ÖπùïÃ∞Å—Ã§(ÄÄÄÅâΩë‰ÄÙÅâ’•±ë}âΩë‰°¡…•çïÃ∞Åç°ÖπùïÃ∞Å¡ΩÕ•—•ΩπÖ∞∞Åôπú∞Å—Ã§(ÄÄÄÅ¡ΩÕ—}¡Ö•»°Õ—»°ç°Ö…—}¡Ö—†§∞ÅçÖ¡—•Ω∏∞ÅâΩë‰§(ÄÄÄÅ±Ωú†â…öÆFWEˆ˜fW'fñWr"¬'˜7FVBÙ≤"ê†¶ñbıˆÊ÷UıÚ”“%ıˆ÷ñÂıÚ#†¢÷ñ‚Çê
+    lines.append(f"üìä –ø–æ –ø–æ–∑–∏—Ü–∏—è–º:".format(
+        positional.sorted(key=lambda h: h.get("ok",False), reverse=True)
+        .items()
+        .items()
+        .map(lambda c: f"üìå {c[0]} (–∏–∑–º. {c[1]:.1%})"
+                        f" ‚Üí ((–µ—Å–ª–∏ {c[0]} –≤ {c[1]:.1%} —Ç—Äy–Ω–¥, "
+                        f"–∏—Å—Ç–æ—á–Ω–∏–∫ - {c[2]})".format(c=c))
+        ))
+    lines.append(f"üòÅ F&G: {fng['value']} ({fng['classification']})")
+    lines.append(f"üóì {ts['t']}")
+    return "\n".join(lines)
+
+def post_prices(post_path: str, prices: dict, changes: dict, positional: dict, fng: dict, ts: dict) -> None:
+    """Writes the header in the post: ticker price and %change."""
+    positional_str = ""
+    for t, p in prices.items():
+        line = f"{t}: {p}$".format(t=t.upper(), p=p.price)
+        ch = changes.get(t, 0.0)
+        earliest = "‚è±" if ch > 0 else "‚è±"
+        partial_ticker = {"line": line, "earliest": earliest, "change": ch}
+        if partial_ticker.change in positional_ticker_changes:
+            positional_ticker_changes[partial_ticker.change]['line'] = line
+            positional_ticker_changes[partial_ticker.change]['change'] = ch
+            positional_ticker_changes[partial_ticker.change]['earliest'] = earliest
+        elif partial_ticker['change'] != ch:
+            partial_ticker['line'] = line
+            partial_ticker['change']: ch
+            partial_ticker['earliest'] = earliest
+    positional_str = "\n".join(positional_ticker_changes)
+    lines = []
+    lines.append(f"{t} ${p:,.2f} ({c:+.2f}%) {emoji}".format(t=t.upper(), p=p.price, c=ch, emoji=earliest))
+    body = build_body(prices, changes, positional, fng, ts)
+    text = f"{chr(10)}{chr(10)}".join([body, positional_str])
+    post_dir(post_path)
+    Path(post_path).write_text(text, encoding="utf-8")
+    log("üìù post saved: %s, len=%d", post_path, len(text))
+    post_pair(text, "market_overview", "posted OK")
+
+if __name__ == "__main__":
+    main()
