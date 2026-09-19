@@ -1,28 +1,31 @@
 """13:30 YEKT market overview — BTC/ETH/BNB/SOL/XRP + Gold/Silver с позиционным слоем.
 
 Полностью автономный: 4 источника цены, верификация перед публикацией,
-фолбэки при недоступности, анти-спам фильтр на волатильности,
-форматирование через Telegram HTML.
-
-Запускается планировщиком ежедневно в 13:30 Asia/Yekaterinburg.
-Все сбои — текстом в лог, ни одного необработанного исключения наружу.
+пересборка при расхождении, retry 3×15 мин при сбоях данных.
 """
-
 from __future__ import annotations
 
-import asyncio
-import json
-import logging
 import os
-import statistics
 import sys
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from typing import Any, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
-import aiohttp
+import requests
 
-# --- Конфигурация -----------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-YEKT = timezone(timedelta(hours=5))
+from lib import chart as chartlib  # noqa: E402
+from lib.common import load_env, log, post_dir, setup_logger  # noqa: E402
+from lib.post import fmt_price, fmt_change, fmt_volume  # noqa: E402
+from lib.publish import post_pair  # noqa: E402
+
+YEKT = ZoneInfo("Asia/Yekaterinburg")
+
+CRYPTO_TICKERS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
+BINANCE_SYMBOL = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT",
+                  "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+METAL_SYMBOLS = {"Gold": "GC=F", "Silver": "SI=F"}
+COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "
