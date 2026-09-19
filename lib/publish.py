@@ -12,6 +12,8 @@ logger = setup_logger("publish")
 ENV = load_env()
 TOKEN = ENV["REDDINGTON_BOT_TOKEN"]
 CHAT_ID = ENV["REDDINGTON_CHANNEL_ID"]
+import hashlib as _hb
+logger.info(f"token prefix={TOKEN[:12]}... len={len(TOKEN)} sha1={_hb.sha1(TOKEN.encode()).hexdigest()[:8]} chat_id={CHAT_ID!r}")
 
 
 def _api(method, **fields):
@@ -118,15 +120,14 @@ def post_donation_pinned(donate_url):
     """Post a pinned donation message with URL button."""
     body = (
         "💎 <b>Поддержать REDDINGTON</b>\n\n"
-        "Канал работает автономно на GitHub Actions — "
-        "каждый пост стоит вычислительного времени и сторонних API. "
-        "Если аналитика полезна, поддержи проект донатом.\n\n"
-        "💸 <b>USDT (TRC-20)</b>\n"
-        f"<code>TUPvVv13hABbf6R4tL3vM7ouNGBHrdKrpu</code>\n\n"
-        "🤖 <b>CryptoBot</b> — кнопка ниже."
+        "Канал делается для вас и за ваши донаты. "
+        "Любая сумма помогает нам делать больше разборов, "
+        "улучшать бот и добавлять новые фичи.\n\n"
+        "🔗 Нажмите кнопку ниже — откроется безопасный "
+        "инвойс от @CryptoBot (BTC, ETH, TON, USDT и др.)"
     )
     markup = url_button("💸 Поддержать REDDINGTON", donate_url)
     mid = send_text(body, reply_markup=markup)
     if mid:
-        pin_message(mid, disable_notification=True)
+        pin_message(mid)
     return mid
