@@ -1,0 +1,3 @@
+"""13:30 YEKT market overview — BTC/ETH/BNB/SOL/XRP + Gold/Silver с позиционным слоем.
+
+Полностью автономный: 4 источника цены, верификаци�
