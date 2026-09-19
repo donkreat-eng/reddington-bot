@@ -32,6 +32,7 @@ def load_env():
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip()
         return env
+    # GitHub Actions: load from environment
     env = {}
     for k in ["REDDINGTON_BOT_TOKEN", "REDDINGTON_CHANNEL_ID", "REDDINGTON_CHANNEL_NAME"]:
         v = os.environ.get(k)
@@ -42,10 +43,16 @@ def load_env():
     return env
 
 
-def setup_logger(name):
+_LOGGERS: dict[str, logging.Logger] = {}
+
+
+def setup_logger(name="market_overview"):
     """Logger that writes to file and stdout."""
+    if name in _LOGGERS:
+        return _LOGGERS[name]
     logger = logging.getLogger(name)
     if logger.handlers:
+        _LOGGERS[name] = logger
         return logger
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
@@ -57,7 +64,18 @@ def setup_logger(name):
     sh.setFormatter(fmt)
     logger.addHandler(fh)
     logger.addHandler(sh)
+    _LOGGERS[name] = logger
     return logger
+
+
+def log(name: str, msg: str) -> None:
+    """Quick log helper — uses cached logger by name."""
+    setup_logger(name).info(msg)
+
+
+def post_dir() -> Path:
+    """Return POST_DIR as Path."""
+    return POST_DIR
 
 
 def ye_now():
