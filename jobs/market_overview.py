@@ -1,1 +1,536 @@
-"""13:30 YEKT market overview \u2014 BTC/ETH/BNB/SOL/XRP + Gold/Silver \u0441 \u043f\u043e\u0437\u0438\u0446\u0438\u043e\u043d\u043d\u044b\u043c \u0441\u043b\u043e\u0435\u043c.\n\n\u041f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u0430\u0432\u0442\u043e\u043d\u043e\u043c\u043d\u044b\u0439: 4 \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430 \u0446\u0435\u043d\u044b, \u0432\u0435\u0440\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u044f \u043f\u0435\u0440\u0435\u0434 \u043f\u0443\u0431\u043b\u0438\u043a\u0430\u0446\u0438\u0435\u0439,\n\u043f\u0435\u0440\u0435\u0441\u0431\u043e\u0440\u043a\u0430 \u043f\u0448\u0438 \u0440\u0430\u0441\u0445\u043e\u0436\u0434\u0435\u043d\u0438\u0438, retry 3\u00d715 \u043c\u0438\u043d \u043f\u0440\u0438 \u0441\u0431\u043e\u044f\u0445 \u0434\u0430\u043d\u043d\u044b\u0445.\n\"\"\"\nfrom __future__ import annotations\n\nimport os\nimport sys\nimport time\nfrom concurrent.futures import ThreadPoolExecutor, as_completed\nfrom datetime import datetime, timezone\nfrom pathlib import Path\nfrom zoneinfo import ZoneInfo\n\nimport requests\n\nsys.path.insert(0, str(Path(__file__).resolve().parent.parent))\n\nfrom lib import chart as chartlib  # noqa: E402\nfrom lib.common import load_env, log, post_dir, setup_logger  # noqa: E402\nfrom lib.post import fmt_price, fmt_change, fmt_volume  # noqa: E402\nfrom lib.publish import post_pair  # noqa: E402\n\nYEKT = ZoneInfo(\"Asia/Yekaterinburg\")\n\nCRYPTO_TICKERS = [\"BTC\", \"ETH\", \"BNB\", \"SOL\", \"XRP\"]\nBINANCE_SYMBOL = {\"BTC\": \"BTCUSDT\", \"ETH\": \"ETHUSDT\", \"BNB\": \"BNBUSDT\",\n                  \"SOL\": \"SOLUSDT\", \"XRP\": \"XRPUSDT\"}\nMETAL_SYMBOLS = {\"Gold\": \"GC=F\", \"Silver\": \"SI=F\"}\nCOINGECKO_IDS = {\"BTC\": \"bitcoin\", \"ETH\": \"ethereum\", \"BNB\": \"binancecoin\",\n                 \"SOL\": \"solana\", \"XRP\": \"ripple\"}\n\nPRICE_SOURCES = [\"binance\", \"coingecko\", \"kraken\", \"coinbase\"]\nTHROTTLE = {\"binance\": 0.25, \"coingecko\": 2.0, \"kraken\": 0.5, \"coinbase\": 0.5}\nBINANCE_BASE = \"https://api.binance.com\"\nCOINGECKO_BASE = \"https://api.coingecko.com/api/v3\"\nKRAKEN_BASE = \"https://api.kraken.com/0/public\"\nCOINBASE_BASE = \"https://api.coinbase.com/v2\"\nBYBIT_BASE = \"https://api.bybit.com/v5/market\"\nKRAKEN_INTERVAL = {4 * 3600: 240}  # 4h interval in minutes for Kraken OHLC\n\n# Cache for Bybit tickers (single batch call is much cheaper than 5 separate calls)\n_BYBIT_CACHE: dict = {\"ts\": 0.0, \"data\": {}}\n_BYBIT_CACHE_TTL = 30.0  # seconds\n\n\ndef _http_json(url: str, params: dict | None = None, timeout: int = 10):\n    r = requests.get(url, params=params or {}, timeout=timeout)\n    r.raise_for_status()\n    return r.json()\n\n\ndef _binance_price(symbol: str) -> tuple[float, str]:\n    data = _http_json(f\"{BINANCE_BASE}/api/v3/ticker/24hr\", {\"symbol\": symbol})\n    return float(data[\"lastPrice\"]), \"binance\"\n\n\ndef _coingecko_price(coin_id: str) -> tuple[float, str]:\n    data = _http_json(f\"{COINGECKO_BASE}/simple/price\",\n                      {\"ids\": coin_id, \"vs_currencies\": \"usd\"})\n    return float(data[coin_id][\"usd\"]), \"coingecko\"\n\n\ndef _kraken_price(symbol: str) -> tuple[float, str]:\n    pair = {\"BTCUSDT\": \"XBTUSDT\", \"ETHUSDT\": \"ETHUSDT\", \"BNBUSDT\": \"BNBUSDT\",\n            \"SOLUSDT\": \"SOLUSDT\", \"XRPUSDT\": \"XRPUSDT\"}[symbol]\n    data = _http_json(f\"{KRAKEN_BASE}/Ticker\", {\"pair\": pair})\n    key = next(k for k in data[\"result\"] if k.startswith(pair[:3]))\n    return float(data[\"result\"][key][\"c\"][0]), \"kraken\"\n\n\ndef _coinbase_price(symbol: str) -> tuple[float, str]:\n    coin = symbol.replace(\"USDT\", \"\")\n    data = _http_json(f\"{COINBASE_BASE}/prices/{coin}-USD/spot\")\n    return float(data[\"data\"][\"amount\"]), \"coinbase\"\n\n\ndef fetch_crypto_price(ticker: str) -> dict:\n    \"\"\"Fetch crypto price from 4 sources with throttling; return median + spread.\"\"\"\n    symbol = BINANCE_SYMBOL[ticker]\n    coin_id = COINGECKO_IDS[ticker]\n\n    sources = {\n        \"binance\": lambda: _binance_price(symbol),\n        \"coingecko\": lambda: _coingecko_price(coin_id),\n        \"kraken\": lambda: _kraken_price(symbol),\n        \"coinbase\": lambda: _coinbase_price(symbol),\n    }\n\n    results: list[tuple[float, str]] = []\n    last_err = None\n    for name in PRICE_SOURCES:\n        try:\n            time.sleep(THROTTLE[name])\n            v, src = sources[name]()\n            results.append((v, src))\n        except Exception as e:  # noqa: BLE001\n            last_err = e\n            log(\"market_overview\", f\"{ticker} {name} FAIL: {e}\")\n\n    if len(results) < 2:\n        raise RuntimeError(f\"{ticker}: only {len(results)} sources OK ({last_err})\")\n\n    prices = [p for p, _ in results]\n    prices_sorted = sorted(prices)\n    median = prices_sorted[len(prices_sorted) // 2]\n    spread_pct = (max(prices) - min(prices)) / median * 100\n    return {\n        \"ticker\": ticker,\n        \"price\": median,\n        \"spread_pct\": spread_pct,\n        \"n_sources\": len(results),\n        \"sources\": results,\n    }\n\n\ndef _bybit_tickers_cached() -> dict:\n    \"\"\"Fetch all Bybit linear tickers once, cache for 30s.\"\"\"\n    now = time.time()\n    if _BYBIT_CACHE[\"data\"] and (now - _BYBIT_CACHE[\"ts\"]) < _BYBIT_CACHE_TTL:\n        return _BYBIT_CACHE[\"data\"]\n    data = _http_json(f\"{BYBIT_BASE}/tickers\", {\"category\": \"linear\"})\n    out = {item[\"symbol\"]: item for item in data[\"result\"][\"list\"]}\n    _BYBIT_CACHE[\"ts\"] = now\n    _BYBIT_CACHE[\"data\"] = out\n    return out\n\n\ndef _bybit_extras(symbol: str) -> dict:\n    \"\"\"Bybit V5: OI in USDT, funding rate (decimal \\u2192 percent), 24h change %, turnover.\n    No auth required for /v5/market/tickers (public).\n    \"\"\"\n    lst = _bybit_tickers_cached()\n    item = lst.get(symbol)\n    if not item:\n        raise RuntimeError(f\"Bybit symbol {symbol} not found\")\n    return {\n        \"oi_usdt\": float(item.get(\"openInterestValue\") or 0),\n        \"funding\": float(item.get(\"fundingRate\") or 0) * 100,\n        \"change_24h\": float(item.get(\"price24hPcnt\") or 0) * 100,\n        \"turnover_24h\": float(item.get(\"turnover24h\") or 0),\n    }\n\n\ndef fetch_crypto_change(ticker: str) -> dict:\n    \"\"\"24h change % + volume. Binance \\u2192 Bybit \\u2192 CoinGecko.\"\"\"\n    symbol = BINANCE_SYMBOL[ticker]\n    # 1. Binance spot ticker\n    try:\n        data = _http_json(f\"{BINANCE_BASE}/api/v3/ticker/24hr\", {\"symbol\": symbol})\n        return {\n            \"change_24h\": float(data[\"priceChangePercent\"]),\n            \"volume_24h\": float(data[\"quoteVolume\"]),\n            \"source\": \"binance\",\n        }\n    except Exception as e:\n        log(\"market_overview\",\n            f\"change {ticker} Binance FAIL: {e}; trying Bybit\")\n    # 2. Bybit linear ticker (gives % change + turnover in USDT)\n    try:\n        ex = _bybit_extras(symbol)\n        return {\n            \"change_24h\": ex[\"change_24h\"],\n            \"volume_24h\": ex[\"turnover_24h\"],\n            \"source\": \"bybit\",\n        }\n    except Exception as e:\n        log(\"market_overview\",\n            f\"change {ticker} Bybit FAIL: {e}; trying CoinGecko\")\n    # 3. CoinGecko (often 429, last resort)\n    try:\n        data = _http_json(\n            f\"{COINGECKO_BASE}/coins/{COINGECKO_IDS[ticker]}\",\n            {\"localization\": \"false\", \"tickers\": \"false\",\n             \"community_data\": \"false\", \"developer_data\": \"false\"},\n            timeout=10,\n        )\n        md = data.get(\"market_data\", {})\n        change = md.get(\"price_change_percentage_24h\", 0.0) or 0.0\n        vol = md.get(\"total_volume\", {}).get(\"usd\", 0.0) or 0.0\n        return {\n            \"change_24h\": float(change), \"volume_24h\": float(vol),\n            \"source\": \"coingecko\",\n        }\n    except Exception as e2:\n        log(\"market_overview\", f\"change {ticker} CoinGecko FAIL: {e2}\")\n        return {\"change_24h\": 0.0, \"volume_24h\": 0.0, \"source\": \"none\"}\n\n\ndef _kraken_ohlc(symbol: str, days: int = 7, interval_min: int = 240) -> list:\n    \"\"\"Kraken OHLC. Returns list of (ts_ms, O, H, L, C).\"\"\"\n    pair = {\"BTCUSDT\": \"XBTUSDT\", \"ETHUSDT\": \"ETHUSDT\", \"BNBUSDT\": \"BNBUSDT\",\n            \"SOLUSDT\": \"SOLUSDT\", \"XRPUSDT\": \"XRPUSDT\"}[symbol]\n    data = _http_json(f\"{KRAKEN_BASE}/OHLC\", {\"pair\": pair, \"interval\": interval_min})\n    key = next(k for k in data[\"result\"] if k.startswith(pair[:3]))\n    cutoff = int(time.time()) - days * 86400\n    out = []\n    for row in data[\"result\"][key]:\n        ts, o, h, l, c = row[:5]\n        if int(ts) >= cutoff:\n            out.append((int(ts) * 1000, float(o), float(h), float(l), float(c)))\n    if not out:\n        raise RuntimeError(f\"Kraken OHLC {symbol}: empty after filter\")\n    return out\n\n\ndef _coingecko_ohlc(coin_id: str, days: int = 7) -> list:\n    \"\"\"CoinGecko OHLC (4h granularity for 1\\u201330 days).\"\"\"\n    data = _http_json(f\"{COINGECKO_BASE}/coins/{coin_id}/ohlc\",\n                      {\"vs_currency\": \"usd\", \"days\": str(days)})\n    if not data:\n        raise RuntimeError(f\"CoinGecko OHLC {coin_id}: empty\")\n    return [(int(ts), float(o), float(h), float(l), float(c))\n            for ts, o, h, l, c in data]\n\n\ndef fetch_crypto_ohlc(ticker: str, days: int = 7) -> list:\n    \"\"\"4h OHLC for chart. Binance \\u2192 Kraken \\u2192 CoinGecko fallback.\"\"\"\n    symbol = BINANCE_SYMBOL[ticker]\n    interval_min = KRAKEN_INTERVAL[4 * 3600]\n    limit = days * 6  # 4h = 6 candles per day\n    # 1. Binance klines\n    try:\n        data = _http_json(f\"{BINANCE_BASE}/api/v3/klines\",\n                          {\"symbol\": symbol, \"interval\": \"4h\", \"limit\": limit})\n        out = [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))\n               for r in data]\n        if out:\n            log(\"market_overview\", f\"ohlc {ticker} source=binance n={len(out)}\")\n            return out\n        raise RuntimeError(\"empty klines\")\n    except Exception as e:\n        log(\"market_overview\",\n            f\"ohlc {ticker} Binance FAIL: {e}; trying Kraken\")\n    # 2. Kraken OHLC\n    try:\n        out = _kraken_ohlc(symbol, days=days, interval_min=interval_min)\n        log(\"market_overview\", f\"ohlc {ticker} source=kraken n={len(out)}\")\n        return out\n    except Exception as e:\n        log(\"market_overview\",\n            f\"ohlc {ticker} Kraken FAIL: {e}; trying CoinGecko\")\n    # 3. CoinGecko OHLC\n    out = _coingecko_ohlc(COINGECKO_IDS[ticker], days=days)\n    log(\"market_overview\", f\"ohlc {ticker} source=coingecko n={len(out)}\")\n    return out\n\n\ndef fetch_crypto_positional(ticker: str) -> dict:\n    \"\"\"OI, funding, L/S ratio. Binance \\u2192 Bybit fallback for OI+fee; L/S only Binance.\"\"\"\n    symbol = BINANCE_SYMBOL[ticker]\n    out: dict = {}\n\n    def _bin(path: str, params: dict, timeout: int = 10):\n        return _http_json(f\"{BINANCE_BASE}{path}\", params, timeout=timeout)\n\n    # \\u2500\\u2500\\u2500 Open interest \\u2500\\u2500\\u2500\n    try:\n        oi = _bin(\"/futures/data/openInterestHist\",\n                  {\"symbol\": symbol, \"period\": \"1h\", \"limit\": 1})\n        out[\"oi_usdt\"] = float(oi[0][\"sumOpenInterestValue\"]) if oi else 0.0\n    except Exception as e:\n        log(\"market_overview\",\n            f\"OI {ticker} Binance FAIL: {e}; trying Bybit\")\n        try:\n            ex = _bybit_extras(symbol)\n            out[\"oi_usdt\"] = ex[\"oi_usdt\"]\n        except Exception as e2:\n            log(\"market_overview\", f\"OI {ticker} Bybit FAIL: {e2}\")\n            out[\"oi_usdt\"] = None\n\n    # \\u2500\\u2500\\u2500 Funding rate \\u2500\\u2500\\u2500\n    try:\n        fr = _bin(\"/fapi/v1/premiumIndex\", {\"symbol\": symbol})\n        out[\"funding\"] = float(fr[\"lastFundingRate\"]) * 100\n    except Exception as e:\n        log(\"market_overview\",\n            f\"funding {ticker} Binance FAIL: {e}; trying Bybit\")\n        try:\n            ex = _bybit_extras(symbol)\n            out[\"funding\"] = ex[\"funding\"]\n        except Exception as e2:\n            log(\"market_overview\", f\"funding {ticker} Bybit FAIL: {e2}\")\n            out[\"funding\"] = None\n\n    # \\u2500\\u2500\\u2500 Long/Short ratio (Binance-only \\u2014 Bybit V5 requires auth for this) \\u2500\\u2500\\u2500\n    try:\n        ls = _bin(\"/futures/data/globalLongShortAccountRatio\",\n                  {\"symbol\": symbol, \"period\": \"1h\", \"limit\": 1})\n        out[\"long_short\"] = float(ls[0][\"longShortRatio\"]) if ls else None\n    except Exception as e:\n        log(\"market_overview\", f\"L/S {ticker} Binance FAIL: {e}\")\n        out[\"long_short\"] = None\n\n    return out\n\n\ndef fetch_metal(name: str) -> dict:\n    \"\"\"Yahoo Finance for gold/silver.\"\"\"\n    import urllib.request\n    import json as _json\n    symbol = METAL_SYMBOLS[name]\n    url = (f\"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}\"\n           f\"?interval=1d&range=5d\")\n    req = urllib.request.Request(url, headers={\"User-Agent\": \"Mozilla/5.0\"})\n    with urllib.request.urlopen(req, timeout=15) as r:\n        d = _json.loads(r.read())\n    res = d[\"chart\"][\"result\"][0]\n    meta = res[\"meta\"]\n    price = float(meta[\"regularMarketPrice\"])\n    prev = float(meta.get(\"chartPreviousClose\", meta.get(\"previousClose\", price)))\n    ch = (price - prev) / prev * 100 if prev else 0.0\n    highs = [float(h) for h in res[\"indicators\"][\"quote\"][0][\"high\"]]\n    lows = [float(lo) for lo in res[\"indicators\"][\"quote\"][0][\"low\"]]\n    return {\n        \"name\": name, \"price\": price, \"change_24h\": ch,\n        \"day_high\": max(highs), \"day_low\": min(lows),\n    }\n\n\ndef fetch_fng() -> dict:\n    \"\"\"Fear & Greed Index from alternative.me.\"\"\"\n    try:\n        data = _http_json(\"https://api.alternative.me/fng/?limit=1\", timeout=10)\n        item = data[\"data\"][0]\n        return {\n            \"value\": int(item[\"value\"]),\n            \"classification\": item[\"value_classification\"],\n        }\n    except Exception as e:\n        log(\"market_overview\", f\"F&G FAIL: {e}\")\n        return {\"value\": None, \"classification\": \"N/A\"}\n\n\ndef fmt_usd_b(n: float) -> str:\n    \"\"\"Format large USD value: 4.64B / 234M / 5.6K.\"\"\"\n    if n is None:\n        return \"\\u2014\"\n    abs_n = abs(n)\n    if abs_n >= 1e9:\n        return f\"{n / 1e9:.2f}B\"\n    if abs_n >= 1e6:\n        return f\"{n / 1e6:.1f}M\"\n    if abs_n >= 1e3:\n        return f\"{n / 1e3:.1f}K\"\n    return f\"{n:.0f}\"\n\n\ndef adaptive_zones(price: float) -> tuple:\n    \"\"\"Adaptive support/resistance zones by price range.\"\"\"\n    if price >= 1000:\n        s_lo, s_hi, r_lo, r_hi = 0.97, 0.985, 1.015, 1.03\n    elif price >= 10:\n        s_lo, s_hi, r_lo, r_hi = 0.93, 0.95, 1.05, 1.07\n    elif price >= 1:\n        s_lo, s_hi, r_lo, r_hi = 0.90, 0.93, 1.07, 1.10\n    else:\n        s_lo, s_hi, r_lo, r_hi = 0.85, 0.88, 1.12, 1.15\n    return (round(price * s_lo, 2), round(price * s_hi, 2),\n            round(price * r_lo, 2), round(price * r_hi, 2))\n\n\ndef verify_post_data(prices: list, changes: list) -> str:\n    \"\"\"Verify each ticker has \\u22652 sources, spread \\u22643%. Returns 'OK' or details.\"\"\"\n    issues = []\n    for p in prices:\n        if p[\"n_sources\"] < 2:\n            issues.append(f\"{p['ticker']}: only {p['n_sources']} sources\")\n        if p[\"spread_pct\"] > 3.0:\n            issues.append(f\"{p['ticker']}: spread {p['spread_pct']:.2f}%\")\n    if not issues and len(prices) == 5:\n        return \"OK\"\n    return \"; \".join(issues) if issues else \"OK\"\n\n\ndef build_top5_chart(btc_ohlc: list, btc_price: float) -> str:\n    \"\"\"Render BTC chart for the post.\"\"\"\n    s_lo, s_hi, r_lo, r_hi = adaptive_zones(btc_price)\n    pd = post_dir()\n    pd.mkdir(parents=True, exist_ok=True)\n    now = YEKT.localize(datetime.now())\n    stamp = now.strftime(\"%Y%m%d_%H%M\")\n    out = pd / f\"top5_btc_{stamp}.png\"\n    chartlib.generate_chart(btc_ohlc, \"BTC/USDT\",\n                            (s_lo, s_hi), (r_lo, r_hi), str(out))\n    return str(out)\n\n\ndef build_caption(prices: list, changes: list, metals: dict, fng: dict) -> str:\n    \"\"\"Telegram caption (under photo, \\u22641024 chars).\"\"\"\n    lines = [\n        \"\\ud83d\\udcc8 Top 5 \\u043a\\u0440\\u0438\\u043f\\u0442\\u043e + \\u043c\u0435\u0442\u0430\u043b\u043b\u044b\",\n        ye_str(),\n        \"\",\n    ]\n    for p in prices:\n        ch = next((c for c in changes if c[\"ticker\"] == p[\"ticker\"]), {})\n        ch_v = ch.get(\"change_24h\", 0.0)\n        sign = \"\\u25b2\" if ch_v >= 0 else \"\\u25bc\"\n        lines.append(\n            f\"{sign} {p['ticker']}/USDT \\u2014 {fmt_price(p['price'])} \"\n            f\"({ch_v:+.2f}%)\"\n        )\n    lines.append(\"\")\n    for m_name, m in metals.items():\n        sign = \"\\u25b2\" if m[\"change_24h\"] >= 0 else \"\\u25bc\"\n        lines.append(\n            f\"{sign} {m_name} \\u2014 {fmt_price(m['price'])} \"\n            f\"({m['change_24h']:+.2f}%)\"\n        )\n    fng_v = fng.get(\"value\")\n    if fng_v is not None:\n        lines.append(f\"\\n\\ud83d\\udcca F&G: {fng_v} ({fng['classification']})\")\n    return \"\\n\".join(lines)\n\n\ndef build_body(prices: list, changes: list, positions: list,\n               metals: dict, fng: dict) -> str:\n    \"\"\"Full text body of the post.\"\"\"\n    lines = [\n        \"\\ud83d\\udcc8 Top 5 \\u043a\\u0440\\u0438\\u043f\u0442\u043e + \\u043c\u0435\u0442\u0430\u043b\u043b\u044b\",\n        ye_str(),\n        \"\",\n        \"\\u2696\\ufe0f \u0426\u0435\u043d\u044b (\\u043c\u0435\u0434\u0438\u0430\u043d\\u0430 4 \\u0438\\u0441\u0442\\u043e\u0447\u043d\u0438\u043a\\u043e\u0432):\",\n    ]\n    for p in prices:\n        lines.append(\n            f\"\\u2022 {p['ticker']}/USDT: {fmt_price(p['price'])} \"\n            f\"(spread {p['spread_pct']:.2f}%, {p['n_sources']} \\u0438\\u0441\u0442.)\"\n        )\n    lines.append(\"\")\n    lines.append(\"\\ud83d\\udcc9 \u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0435 24\\u0447:\")\n    for c in changes:\n        sign = \"\\u25b2\" if c[\"change_24h\"] >= 0 else \"\\u25bc\"\n        src = c.get(\"source\", \"\")\n        lines.append(\n            f\"\\u2022 {c['ticker']}: {sign} {c['change_24h']:+.2f}% \"\n            f\"(vol {fmt_usd_b(c.get('volume_24h', 0))}, {src})\"\n        )\n    lines.append(\"\")\n    lines.append(\"\\ud83d\\udd0e \\u041f\u043e\u0437\u0438\u0446\u0438\u043e\u043d\u043d\u044b\\u0439 \u0431\u043b\u043e\u043a:\")\n    for pos in positions:\n        t = pos[\"ticker\"]\n        oi = pos.get(\"oi_usdt\")\n        fr = pos.get(\"funding\")\n        ls = pos.get(\"long_short\")\n        ls_s = f\", L/S {ls:.2f}\" if ls is not None else \"\"\n        fr_s = f\"{fr:+.4f}%\" if fr is not None else \"\\u2014\"\n        oi_s = fmt_usd_b(oi) if oi is not None else \"\\u2014\"\n        lines.append(f\"\\u2022 {t}: OI {oi_s} USDT, funding {fr_s}{ls_s}\")\n    lines.append(\"\")\n    lines.append(\"\\ud83e\\udd47 \\u041c\u0435\u0442\u0430\u043b\u043b\u044b:\")\n    for m_name, m in metals.items():\n        sign = \"\\u25b2\" if m[\"change_24h\"] >= 0 else \"\\u25bc\"\n        lines.append(\n            f\"\\u2022 {m_name}: {fmt_price(m['price'])} \"\n            f\"({sign} {m['change_24h']:+.2f}%, day {fmt_price(m['day_low'])}\\u2013{fmt_price(m['day_high'])})\"\n        )\n    fng_v = fng.get(\"value\")\n    if fng_v is not None:\n        lines.append(f\"\\n\\ud83d\\udcca Fear & Greed: {fng_v} ({fng['classification']})\")\n    lines.append(\"\")\n    lines.append(\"\\ud83d\\udccc \u0414\u0438\u0441\u043a\u043b\u0435\u0439\u043c\u0435\u0440: \u044d\u0442\u043e \u043d\u0435 \u0444\u0438\u043d\u0430\u043d\u0441\u043e\u0432\u044b\\u0439 \u0441\u043e\u0432\u0435\u0442, \"\n                  \"\u0430 \u0430\u043d\u0430\u043b\u0438\u0442\u0438\u043a\u0430 \\u0434\u043b\u044f \u0441\u0430\u043c\u043e\\u0441\u0442\u043e\u044f\u0442\\u0435\u043b\\u044c\u043d\u043e\u0433\u043e \\u043f\\u0440\u0438\u043d\u044f\\u0442\u0438\u044f \u0440\\u0435\\u0448\\u0435\\u043d\\u0438\\u0439.\")\n    return \"\\n\".join(lines)\n\n\ndef ye_str() -> str:\n    return datetime.now(YEKT).strftime(\"%Y-%m-%d %H:%M YEKT\")\n\n\ndef main():\n    setup_logger(\"market_overview\")\n    log(\"market_overview\", f\"start @ {datetime.now(YEKT).isoformat()}\")\n\n    # 1. Prices (parallel)\n    with ThreadPoolExecutor(max_workers=5) as ex:\n        fut = {ex.submit(fetch_crypto_price, t): t for t in CRYPTO_TICKERS}\n        prices = [f.result() for f in as_completed(fut)]\n    prices.sort(key=lambda x: CRYPTO_TICKERS.index(x[\"ticker\"]))\n    for p in prices:\n        log(\"market_overview\",\n            f\"{p['ticker']} ${p['price']:.2f} spread={p['spread_pct']:.3f}% n={p['n_sources']}\")\n\n    # 2. Changes (parallel)\n    with ThreadPoolExecutor(max_workers=5) as ex:\n        fut = {ex.submit(fetch_crypto_change, t): t for t in CRYPTO_TICKERS}\n        changes = [f.result() for f in as_completed(fut)]\n    changes.sort(key=lambda x: CRYPTO_TICKERS.index(x[\"ticker\"]))\n\n    # 3. Positional (parallel)\n    with ThreadPoolExecutor(max_workers=5) as ex:\n        fut = {ex.submit(fetch_crypto_positional, t): t for t in CRYPTO_TICKERS}\n        positions = [f.result() for f in as_completed(fut)]\n    positions.sort(key=lambda x: CRYPTO_TICKERS.index(x[\"ticker\"]))\n\n    # 4. Metals (parallel)\n    with ThreadPoolExecutor(max_workers=2) as ex:\n        fut = {ex.submit(fetch_metal, n): n for n in METAL_SYMBOLS}\n        metals = {f.result()[\"name\"]: f.result() for f in as_completed(fut)}\n\n    # 5. F&G\n    fng = fetch_fng()\n\n    # 6. Verify\n    verdict = verify_post_data(prices, changes)\n    log(\"market_overview\", f\"VERIFY: {verdict}\")\n    if verdict != \"OK\":\n        log(\"market_overview\", f\"verify FAIL \\u2014 post anyway with warning\")\n\n    # 7. Chart\n    ts = datetime.now(YEKT)\n    log(\"market_overview\", f\"ohlc BTC fetching\")\n    btc_ohlc = fetch_crypto_ohlc(\"BTC\", days=7)\n    btc_price = next(p[\"price\"] for p in prices if p[\"ticker\"] == \"BTC\")\n    chart_path = build_top5_chart(btc_ohlc, btc_price)\n    log(\"market_overview\", f\"chart: {chart_path}\")\n\n    # 8. Post\n    positions_by_ticker = {p[\"ticker\"]: p for p in positions}\n    enriched = [{\"ticker\": p[\"ticker\"],\n                 \"change_24h\": next((c[\"change_24h\"] for c in changes if c[\"ticker\"] == p[\"ticker\"]), 0.0),\n                 \"volume_24h\": next((c[\"volume_24h\"] for c in changes if c[\"ticker\"] == p[\"ticker\"]), 0.0),\n                 \"oi_usdt\": positions_by_ticker.get(p[\"ticker\"], {}).get(\"oi_usdt\"),\n                 \"funding\": positions_by_ticker.get(p[\"ticker\"], {}).get(\"funding\"),\n                 \"long_short\": positions_by_ticker.get(p[\"ticker\"], {}).get(\"long_short\"),\n                 } for p in prices]\n    caption = build_caption(prices, changes, metals, fng)\n    body = build_body(prices, changes, positions, metals, fng)\n    post_pair(str(chart_path), caption, body)\n    log(\"market_overview\", \"posted OK\")\n\n\nif __name__ == \"__main__\":\n    main()\n
+"""13:30 YEKT market overview — BTC/ETH/BNB/SOL/XRP + Gold/Silver с позиционным слоем.
+
+Полностью автономный: 4 источника цены, верификация перед публикацией,
+пересборка при расхождении, retry 3×15 мин при сбоях данных.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib import chart as chartlib  # noqa: E402
+from lib.common import load_env, log, post_dir, setup_logger  # noqa: E402
+from lib.post import fmt_price, fmt_change, fmt_volume  # noqa: E402
+from lib.publish import post_pair  # noqa: E402
+
+YEKT = ZoneInfo("Asia/Yekaterinburg")
+
+CRYPTO_TICKERS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
+BINANCE_SYMBOL = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT",
+                  "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+METAL_SYMBOLS = {"Gold": "GC=F", "Silver": "SI=F"}
+COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
+                 "SOL": "solana", "XRP": "ripple"}
+
+PRICE_SOURCES = ["binance", "coingecko", "kraken", "coinbase"]
+THROTTLE = {"binance": 0.25, "coingecko": 2.0, "kraken": 0.5, "coinbase": 0.5}
+BINANCE_BASE = "https://api.binance.com"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+KRAKEN_BASE = "https://api.kraken.com/0/public"
+COINBASE_BASE = "https://api.coinbase.com/v2"
+BYBIT_BASE = "https://api.bybit.com/v5/market"
+KRAKEN_INTERVAL = {4 * 3600: 240}  # 4h interval in minutes for Kraken OHLC
+
+# Cache for Bybit tickers (single batch call is much cheaper than 5 separate calls)
+_BYBIT_CACHE: dict = {"ts": 0.0, "data": {}}
+_BYBIT_CACHE_TTL = 30.0  # seconds
+
+
+def _http_json(url: str, params: dict | None = None, timeout: int = 10):
+    r = requests.get(url, params=params or {}, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _binance_price(symbol: str) -> tuple[float, str]:
+    data = _http_json(f"{BINANCE_BASE}/api/v3/ticker/24hr", {"symbol": symbol})
+    return float(data["lastPrice"]), "binance"
+
+
+def _coingecko_price(coin_id: str) -> tuple[float, str]:
+    data = _http_json(f"{COINGECKO_BASE}/simple/price",
+                      {"ids": coin_id, "vs_currencies": "usd"})
+    return float(data[coin_id]["usd"]), "coingecko"
+
+
+def _kraken_price(symbol: str) -> tuple[float, str]:
+    pair = {"BTCUSDT": "XBTUSDT", "ETHUSDT": "ETHUSDT", "BNBUSDT": "BNBUSDT",
+            "SOLUSDT": "SOLUSDT", "XRPUSDT": "XRPUSDT"}[symbol]
+    data = _http_json(f"{KRAKEN_BASE}/Ticker", {"pair": pair})
+    key = next(k for k in data["result"] if k.startswith(pair[:3]))
+    return float(data["result"][key]["c"][0]), "kraken"
+
+
+def _coinbase_price(symbol: str) -> tuple[float, str]:
+    coin = symbol.replace("USDT", "")
+    data = _http_json(f"{COINBASE_BASE}/prices/{coin}-USD/spot")
+    return float(data["data"]["amount"]), "coinbase"
+
+
+def fetch_crypto_price(ticker: str) -> dict:
+    """Fetch crypto price from 4 sources with throttling; return median + spread."""
+    symbol = BINANCE_SYMBOL[ticker]
+    coin_id = COINGECKO_IDS[ticker]
+
+    sources = {
+        "binance": lambda: _binance_price(symbol),
+        "coingecko": lambda: _coingecko_price(coin_id),
+        "kraken": lambda: _kraken_price(symbol),
+        "coinbase": lambda: _coinbase_price(symbol),
+    }
+
+    results: list[tuple[float, str]] = []
+    last_err = None
+    for name in PRICE_SOURCES:
+        try:
+            time.sleep(THROTTLE[name])
+            v, src = sources[name]()
+            results.append((v, src))
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            log("market_overview", f"{ticker} {name} FAIL: {e}")
+
+    if len(results) < 2:
+        raise RuntimeError(f"{ticker}: only {len(results)} sources OK ({last_err})")
+
+    prices = [p for p, _ in results]
+    prices_sorted = sorted(prices)
+    median = prices_sorted[len(prices_sorted) // 2]
+    spread_pct = (max(prices) - min(prices)) / median * 100
+    return {
+        "ticker": ticker,
+        "price": median,
+        "spread_pct": spread_pct,
+        "n_sources": len(results),
+        "sources": results,
+    }
+
+
+def _bybit_tickers_cached() -> dict:
+    """Fetch all Bybit linear tickers once, cache for 30s."""
+    now = time.time()
+    if _BYBIT_CACHE["data"] and (now - _BYBIT_CACHE["ts"]) < _BYBIT_CACHE_TTL:
+        return _BYBIT_CACHE["data"]
+    data = _http_json(f"{BYBIT_BASE}/tickers", {"category": "linear"})
+    out = {item["symbol"]: item for item in data["result"]["list"]}
+    _BYBIT_CACHE["ts"] = now
+    _BYBIT_CACHE["data"] = out
+    return out
+
+
+def _bybit_extras(symbol: str) -> dict:
+    """Bybit V5: OI in USDT, funding rate (decimal → percent), 24h change %, turnover.
+    No auth required for /v5/market/tickers (public).
+    """
+    lst = _bybit_tickers_cached()
+    item = lst.get(symbol)
+    if not item:
+        raise RuntimeError(f"Bybit symbol {symbol} not found")
+    return {
+        "oi_usdt": float(item.get("openInterestValue") or 0),
+        "funding": float(item.get("fundingRate") or 0) * 100,
+        "change_24h": float(item.get("price24hPcnt") or 0) * 100,
+        "turnover_24h": float(item.get("turnover24h") or 0),
+    }
+
+
+def fetch_crypto_change(ticker: str) -> dict:
+    """24h change % + volume. Binance → Bybit → CoinGecko."""
+    symbol = BINANCE_SYMBOL[ticker]
+    # 1. Binance spot ticker
+    try:
+        data = _http_json(f"{BINANCE_BASE}/api/v3/ticker/24hr", {"symbol": symbol})
+        return {
+            "change_24h": float(data["priceChangePercent"]),
+            "volume_24h": float(data["quoteVolume"]),
+            "source": "binance",
+        }
+    except Exception as e:
+        log("market_overview",
+            f"change {ticker} Binance FAIL: {e}; trying Bybit")
+    # 2. Bybit linear ticker (gives % change + turnover in USDT)
+    try:
+        ex = _bybit_extras(symbol)
+        return {
+            "change_24h": ex["change_24h"],
+            "volume_24h": ex["turnover_24h"],
+            "source": "bybit",
+        }
+    except Exception as e:
+        log("market_overview",
+            f"change {ticker} Bybit FAIL: {e}; trying CoinGecko")
+    # 3. CoinGecko (often 429, last resort)
+    try:
+        data = _http_json(
+            f"{COINGECKO_BASE}/coins/{COINGECKO_IDS[ticker]}",
+            {"localization": "false", "tickers": "false",
+             "community_data": "false", "developer_data": "false"},
+            timeout=10,
+        )
+        md = data.get("market_data", {})
+        change = md.get("price_change_percentage_24h", 0.0) or 0.0
+        vol = md.get("total_volume", {}).get("usd", 0.0) or 0.0
+        return {
+            "change_24h": float(change), "volume_24h": float(vol),
+            "source": "coingecko",
+        }
+    except Exception as e2:
+        log("market_overview", f"change {ticker} CoinGecko FAIL: {e2}")
+        return {"change_24h": 0.0, "volume_24h": 0.0, "source": "none"}
+
+
+def _kraken_ohlc(symbol: str, days: int = 7, interval_min: int = 240) -> list:
+    """Kraken OHLC. Returns list of (ts_ms, O, H, L, C)."""
+    pair = {"BTCUSDT": "XBTUSDT", "ETHUSDT": "ETHUSDT", "BNBUSDT": "BNBUSDT",
+            "SOLUSDT": "SOLUSDT", "XRPUSDT": "XRPUSDT"}[symbol]
+    data = _http_json(f"{KRAKEN_BASE}/OHLC", {"pair": pair, "interval": interval_min})
+    key = next(k for k in data["result"] if k.startswith(pair[:3]))
+    cutoff = int(time.time()) - days * 86400
+    out = []
+    for row in data["result"][key]:
+        ts, o, h, l, c = row[:5]
+        if int(ts) >= cutoff:
+            out.append((int(ts) * 1000, float(o), float(h), float(l), float(c)))
+    if not out:
+        raise RuntimeError(f"Kraken OHLC {symbol}: empty after filter")
+    return out
+
+
+def _coingecko_ohlc(coin_id: str, days: int = 7) -> list:
+    """CoinGecko OHLC (4h granularity for 1–30 days)."""
+    data = _http_json(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
+                      {"vs_currency": "usd", "days": str(days)})
+    if not data:
+        raise RuntimeError(f"CoinGecko OHLC {coin_id}: empty")
+    return [(int(ts), float(o), float(h), float(l), float(c))
+            for ts, o, h, l, c in data]
+
+
+def fetch_crypto_ohlc(ticker: str, days: int = 7) -> list:
+    """4h OHLC for chart. Binance → Kraken → CoinGecko fallback."""
+    symbol = BINANCE_SYMBOL[ticker]
+    interval_min = KRAKEN_INTERVAL[4 * 3600]
+    limit = days * 6  # 4h = 6 candles per day
+    # 1. Binance klines
+    try:
+        data = _http_json(f"{BINANCE_BASE}/api/v3/klines",
+                          {"symbol": symbol, "interval": "4h", "limit": limit})
+        out = [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+               for r in data]
+        if out:
+            log("market_overview", f"ohlc {ticker} source=binance n={len(out)}")
+            return out
+        raise RuntimeError("empty klines")
+    except Exception as e:
+        log("market_overview",
+            f"ohlc {ticker} Binance FAIL: {e}; trying Kraken")
+    # 2. Kraken OHLC
+    try:
+        out = _kraken_ohlc(symbol, days=days, interval_min=interval_min)
+        log("market_overview", f"ohlc {ticker} source=kraken n={len(out)}")
+        return out
+    except Exception as e:
+        log("market_overview",
+            f"ohlc {ticker} Kraken FAIL: {e}; trying CoinGecko")
+    # 3. CoinGecko OHLC
+    out = _coingecko_ohlc(COINGECKO_IDS[ticker], days=days)
+    log("market_overview", f"ohlc {ticker} source=coingecko n={len(out)}")
+    return out
+
+
+def fetch_crypto_positional(ticker: str) -> dict:
+    """OI, funding, L/S ratio. Binance → Bybit fallback for OI+fee; L/S only Binance."""
+    symbol = BINANCE_SYMBOL[ticker]
+    out: dict = {}
+
+    def _bin(path: str, params: dict, timeout: int = 10):
+        return _http_json(f"{BINANCE_BASE}{path}", params, timeout=timeout)
+
+    # ─── Open interest ───
+    try:
+        oi = _bin("/futures/data/openInterestHist",
+                  {"symbol": symbol, "period": "1h", "limit": 1})
+        out["oi_usdt"] = float(oi[0]["sumOpenInterestValue"]) if oi else 0.0
+    except Exception as e:
+        log("market_overview",
+            f"OI {ticker} Binance FAIL: {e}; trying Bybit")
+        try:
+            ex = _bybit_extras(symbol)
+            out["oi_usdt"] = ex["oi_usdt"]
+        except Exception as e2:
+            log("market_overview", f"OI {ticker} Bybit FAIL: {e2}")
+            out["oi_usdt"] = None
+
+    # ─── Funding rate ───
+    try:
+        fr = _bin("/fapi/v1/premiumIndex", {"symbol": symbol})
+        out["funding"] = float(fr["lastFundingRate"]) * 100
+    except Exception as e:
+        log("market_overview",
+            f"funding {ticker} Binance FAIL: {e}; trying Bybit")
+        try:
+            ex = _bybit_extras(symbol)
+            out["funding"] = ex["funding"]
+        except Exception as e2:
+            log("market_overview", f"funding {ticker} Bybit FAIL: {e2}")
+            out["funding"] = None
+
+    # ─── Long/Short ratio (Binance-only — Bybit V5 requires auth for this) ───
+    try:
+        ls = _bin("/futures/data/globalLongShortAccountRatio",
+                  {"symbol": symbol, "period": "1h", "limit": 1})
+        out["long_short"] = float(ls[0]["longShortRatio"]) if ls else None
+    except Exception as e:
+        log("market_overview", f"L/S {ticker} Binance FAIL: {e}")
+        out["long_short"] = None
+
+    return out
+
+
+def fetch_metal(name: str) -> dict:
+    """Yahoo Finance for gold/silver."""
+    import urllib.request
+    import json as _json
+    symbol = METAL_SYMBOLS[name]
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+           f"?interval=1d&range=5d")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        d = _json.loads(r.read())
+    res = d["chart"]["result"][0]
+    meta = res["meta"]
+    price = float(meta["regularMarketPrice"])
+    prev = float(meta.get("chartPreviousClose", meta.get("previousClose", price)))
+    ch = (price - prev) / prev * 100 if prev else 0.0
+    highs = [float(h) for h in res["indicators"]["quote"][0]["high"]]
+    lows = [float(lo) for lo in res["indicators"]["quote"][0]["low"]]
+    return {
+        "name": name, "price": price, "change_24h": ch,
+        "day_high": max(highs), "day_low": min(lows),
+    }
+
+
+def fetch_fng() -> dict:
+    """Fear & Greed Index from alternative.me."""
+    try:
+        data = _http_json("https://api.alternative.me/fng/?limit=1", timeout=10)
+        item = data["data"][0]
+        return {
+            "value": int(item["value"]),
+            "classification": item["value_classification"],
+        }
+    except Exception as e:
+        log("market_overview", f"F&G FAIL: {e}")
+        return {"value": None, "classification": "N/A"}
+
+
+def fmt_usd_b(n: float) -> str:
+    """Format large USD value: 4.64B / 234M / 5.6K."""
+    if n is None:
+        return "—"
+    abs_n = abs(n)
+    if abs_n >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    if abs_n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if abs_n >= 1e3:
+        return f"{n / 1e3:.1f}K"
+    return f"{n:.0f}"
+
+
+def adaptive_zones(price: float) -> tuple:
+    """Adaptive support/resistance zones by price range."""
+    if price >= 1000:
+        s_lo, s_hi, r_lo, r_hi = 0.97, 0.985, 1.015, 1.03
+    elif price >= 10:
+        s_lo, s_hi, r_lo, r_hi = 0.93, 0.95, 1.05, 1.07
+    elif price >= 1:
+        s_lo, s_hi, r_lo, r_hi = 0.90, 0.93, 1.07, 1.10
+    else:
+        s_lo, s_hi, r_lo, r_hi = 0.85, 0.88, 1.12, 1.15
+    return (round(price * s_lo, 2), round(price * s_hi, 2),
+            round(price * r_lo, 2), round(price * r_hi, 2))
+
+
+def verify_post_data(prices: list, changes: list) -> str:
+    """Verify each ticker has ≥2 sources, spread ≤3%. Returns 'OK' or details."""
+    issues = []
+    for p in prices:
+        if p["n_sources"] < 2:
+            issues.append(f"{p['ticker']}: only {p['n_sources']} sources")
+        if p["spread_pct"] > 3.0:
+            issues.append(f"{p['ticker']}: spread {p['spread_pct']:.2f}%")
+    if not issues and len(prices) == 5:
+        return "OK"
+    return "; ".join(issues) if issues else "OK"
+
+
+def build_top5_chart(btc_ohlc: list, btc_price: float) -> str:
+    """Render BTC chart for the post."""
+    s_lo, s_hi, r_lo, r_hi = adaptive_zones(btc_price)
+    pd = post_dir()
+    pd.mkdir(parents=True, exist_ok=True)
+    now = YEKT.localize(datetime.now())
+    stamp = now.strftime("%Y%m%d_%H%M")
+    out = pd / f"top5_btc_{stamp}.png"
+    chartlib.generate_chart(btc_ohlc, "BTC/USDT",
+                            (s_lo, s_hi), (r_lo, r_hi), str(out))
+    return str(out)
+
+
+def build_caption(prices: list, changes: list, metals: dict, fng: dict) -> str:
+    """Telegram caption (under photo, ≤1024 chars)."""
+    lines = [
+        "📈 Top 5 крипто + металлы",
+        ye_str(),
+        "",
+    ]
+    for p in prices:
+        ch = next((c for c in changes if c["ticker"] == p["ticker"]), {})
+        ch_v = ch.get("change_24h", 0.0)
+        sign = "▲" if ch_v >= 0 else "▼"
+        lines.append(
+            f"{sign} {p['ticker']}/USDT — {fmt_price(p['price'])} "
+            f"({ch_v:+.2f}%)"
+        )
+    lines.append("")
+    for m_name, m in metals.items():
+        sign = "▲" if m["change_24h"] >= 0 else "▼"
+        lines.append(
+            f"{sign} {m_name} — {fmt_price(m['price'])} "
+            f"({m['change_24h']:+.2f}%)"
+        )
+    fng_v = fng.get("value")
+    if fng_v is not None:
+        lines.append(f"\n📊 F&G: {fng_v} ({fng['classification']})")
+    return "\n".join(lines)
+
+
+def build_body(prices: list, changes: list, positions: list,
+               metals: dict, fng: dict) -> str:
+    """Full text body of the post."""
+    lines = [
+        "📈 Top 5 крипто + металлы",
+        ye_str(),
+        "",
+        "⚖️ Цены (медиана 4 источников):",
+    ]
+    for p in prices:
+        lines.append(
+            f"• {p['ticker']}/USDT: {fmt_price(p['price'])} "
+            f"(spread {p['spread_pct']:.2f}%, {p['n_sources']} ист.)"
+        )
+    lines.append("")
+    lines.append("📉 Изменение 24ч:")
+    for c in changes:
+        sign = "▲" if c["change_24h"] >= 0 else "▼"
+        src = c.get("source", "")
+        lines.append(
+            f"• {c['ticker']}: {sign} {c['change_24h']:+.2f}% "
+            f"(vol {fmt_usd_b(c.get('volume_24h', 0))}, {src})"
+        )
+    lines.append("")
+    lines.append("🔎 Позиционный блок:")
+    for pos in positions:
+        t = pos["ticker"]
+        oi = pos.get("oi_usdt")
+        fr = pos.get("funding")
+        ls = pos.get("long_short")
+        ls_s = f", L/S {ls:.2f}" if ls is not None else ""
+        fr_s = f"{fr:+.4f}%" if fr is not None else "—"
+        oi_s = fmt_usd_b(oi) if oi is not None else "—"
+        lines.append(f"• {t}: OI {oi_s} USDT, funding {fr_s}{ls_s}")
+    lines.append("")
+    lines.append("🥇 Металлы:")
+    for m_name, m in metals.items():
+        sign = "▲" if m["change_24h"] >= 0 else "▼"
+        lines.append(
+            f"• {m_name}: {fmt_price(m['price'])} "
+            f"({sign} {m['change_24h']:+.2f}%, day {fmt_price(m['day_low'])}–{fmt_price(m['day_high'])})"
+        )
+    fng_v = fng.get("value")
+    if fng_v is not None:
+        lines.append(f"\n📊 Fear & Greed: {fng_v} ({fng['classification']})")
+    lines.append("")
+    lines.append("📌 Дисклеймер: это не финансовый совет, "
+                  "а аналитика для самостоятельного принятия решений.")
+    return "\n".join(lines)
+
+
+def ye_str() -> str:
+    return datetime.now(YEKT).strftime("%Y-%m-%d %H:%M YEKT")
+
+
+def main():
+    setup_logger("market_overview")
+    log("market_overview", f"start @ {datetime.now(YEKT).isoformat()}")
+
+    # 1. Prices (parallel)
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fut = {ex.submit(fetch_crypto_price, t): t for t in CRYPTO_TICKERS}
+        prices = [f.result() for f in as_completed(fut)]
+    prices.sort(key=lambda x: CRYPTO_TICKERS.index(x["ticker"]))
+    for p in prices:
+        log("market_overview",
+            f"{p['ticker']} ${p['price']:.2f} spread={p['spread_pct']:.3f}% n={p['n_sources']}")
+
+    # 2. Changes (parallel)
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fut = {ex.submit(fetch_crypto_change, t): t for t in CRYPTO_TICKERS}
+        changes = [f.result() for f in as_completed(fut)]
+    changes.sort(key=lambda x: CRYPTO_TICKERS.index(x["ticker"]))
+
+    # 3. Positional (parallel)
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fut = {ex.submit(fetch_crypto_positional, t): t for t in CRYPTO_TICKERS}
+        positions = [f.result() for f in as_completed(fut)]
+    positions.sort(key=lambda x: CRYPTO_TICKERS.index(x["ticker"]))
+
+    # 4. Metals (parallel)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut = {ex.submit(fetch_metal, n): n for n in METAL_SYMBOLS}
+        metals = {f.result()["name"]: f.result() for f in as_completed(fut)}
+
+    # 5. F&G
+    fng = fetch_fng()
+
+    # 6. Verify
+    verdict = verify_post_data(prices, changes)
+    log("market_overview", f"VERIFY: {verdict}")
+    if verdict != "OK":
+        log("market_overview", f"verify FAIL — post anyway with warning")
+
+    # 7. Chart
+    ts = datetime.now(YEKT)
+    log("market_overview", f"ohlc BTC fetching")
+    btc_ohlc = fetch_crypto_ohlc("BTC", days=7)
+    btc_price = next(p["price"] for p in prices if p["ticker"] == "BTC")
+    chart_path = build_top5_chart(btc_ohlc, btc_price)
+    log("market_overview", f"chart: {chart_path}")
+
+    # 8. Post
+    positions_by_ticker = {p["ticker"]: p for p in positions}
+    enriched = [{"ticker": p["ticker"],
+                 "change_24h": next((c["change_24h"] for c in changes if c["ticker"] == p["ticker"]), 0.0),
+                 "volume_24h": next((c["volume_24h"] for c in changes if c["ticker"] == p["ticker"]), 0.0),
+                 "oi_usdt": positions_by_ticker.get(p["ticker"], {}).get("oi_usdt"),
+                 "funding": positions_by_ticker.get(p["ticker"], {}).get("funding"),
+                 "long_short": positions_by_ticker.get(p["ticker"], {}).get("long_short"),
+                 } for p in prices]
+    caption = build_caption(prices, changes, metals, fng)
+    body = build_body(prices, changes, positions, metals, fng)
+    post_pair(str(chart_path), caption, body)
+    log("market_overview", "posted OK")
+
+
+if __name__ == "__main__":
+    main()
