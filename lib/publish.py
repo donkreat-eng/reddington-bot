@@ -6,7 +6,7 @@ import json
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-from common import load_env, setup_logger, ye_str
+from lib.common import load_env, setup_logger, ye_str
 
 logger = setup_logger("publish")
 ENV = load_env()
@@ -15,6 +15,7 @@ CHAT_ID = ENV["REDDINGTON_CHANNEL_ID"]
 
 
 def _api(method, **fields):
+    """Call Telegram Bot API. fields can include text, photo path, etc."""
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
     if "photo" in fields and isinstance(fields["photo"], str):
         boundary = "----ReddingtonBoundary"
@@ -82,6 +83,7 @@ def send_text(text, parse_mode="HTML", disable_notification=False, reply_markup=
 
 
 def pin_message(message_id, disable_notification=False):
+    """Pin a message in the channel."""
     result = _api("pinChatMessage",
                   chat_id=CHAT_ID,
                   message_id=message_id,
@@ -94,6 +96,7 @@ def pin_message(message_id, disable_notification=False):
 
 
 def url_button(text, url):
+    """Build InlineKeyboardMarkup JSON string with a single URL button."""
     return json.dumps({
         "inline_keyboard": [[{"text": text, "url": url}]]
     })
@@ -112,21 +115,18 @@ def send_alert(text):
 
 
 def post_donation_pinned(donate_url):
+    """Post a pinned donation message with URL button."""
     body = (
         "💎 <b>Поддержать REDDINGTON</b>\n\n"
-        "Канал делается для вас и за ваши донаты. "
-        "Любая сумма помогает нам делать больше разборов, "
-        "улучшать бот и добавлять новые фичи.\n\n"
-        "🔗 Нажмите кнопку ниже — откроется безопасный "
-        "инвойс от @CryptoBot (BTC, ETH, TON, USDT и др.).\n\n"
-        "🙏 Спасибо за поддержку!"
+        "Канал работает автономно на GitHub Actions — "
+        "каждый пост стоит вычислительного времени и сторонних API. "
+        "Если аналитика полезна, поддержи проект донатом.\n\n"
+        "💸 <b>USDT (TRC-20)</b>\n"
+        f"<code>TUPvVv13hABbf6R4tL3vM7ouNGBHrdKrpu</code>\n\n"
+        "🤖 <b>CryptoBot</b> — кнопка ниже."
     )
     markup = url_button("💸 Поддержать REDDINGTON", donate_url)
-    msg_id = send_text(body, reply_markup=markup)
-    if msg_id:
-        pin_message(msg_id, disable_notification=False)
-    return msg_id
-
-
-if __name__ == "__main__":
-    send_text(f"🟢 Reddington bot v1.0 — {ye_str()}\nПодключение проверено.")
+    mid = send_text(body, reply_markup=markup)
+    if mid:
+        pin_message(mid, disable_notification=True)
+    return mid
