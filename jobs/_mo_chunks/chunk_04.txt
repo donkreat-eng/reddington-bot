@@ -1,75 +1,53 @@
-            p = data.get("lastPrice")
-            if not isinstance(p, (int, float, str)):
-                continue
-            try:
-                price = float(p)
-            except (TypeError, ValueError):
-                continue
-            base = sym.replace("USDT", "")
-            asset = {"BTC": "BTC", "ETH": "ETH", "BNB": "BNB", "SOL": "SOL", "XRP": "XRP"}.get(base)
-            if asset:
-                out[asset] = PricePoint(asset=asset, source="binance", usd=price, ts=ts)
-                ts_max = max(ts_max, ts)
-        # нормализуем ts на максимум по всем тикерам — это момент «свежести» данных
-        for pp in out.values():
-            if pp.ts < ts_max:
-                pp.ts = ts_max
-        return out
 
-    async def fetch_all(self) -> list[dict[str, PricePoint]]:
-        results = await asyncio.gather(
-            self.fetch_coingecko(),
-            self.fetch_coincap(),
-            self.fetch_kraken(),
-            self.fetch_binance(),
-            return_exceptions=True,
-        )
-        clean: list[dict[str, PricePoint]] = []
-        for i, r in enumerate(results):
-            name = PRICE_SOURCES[i][0]
-            if isinstance(r, BaseException):
-                log.warning("source %s failed: %r", name, r)
-                continue
-            clean.append(r)
-        return clean
-
-    @staticmethod
-    def verify(per_source: list[dict[str, PricePoint]], max_spread_pct: float = 1.5) -> dict[str, VerifiedPrice]:
-        """Медиана + контроль рассеяния. Возвращает только те активы, где разброс ≤ порога."""
-        buckets: dict[str, list[PricePoint]] = {}
-        for src in per_source:
-            for sym, pp in src.items():
-                buckets.setdefault(sym, []).append(pp)
-
-        verified: dict[str, VerifiedPrice] = {}
-        for sym, points in buckets.items():
-            if not points:
-                continue
-            prices = [p.usd for p in points]
-            med = statistics.median(prices)
-            spread = (max(prices) - min(prices)) / med * 100.0 if med else 0.0
-            if spread > max_spread_pct:
-                log.warning(
-                    "spread too wide for %s: %.2f%% (n=%d, src=%s)",
-                    sym, spread, len(points), [p.source for p in points],
-                )
-                continue
-            ts = max(p.ts for p in points)
-            verified[sym] = VerifiedPrice(
-                asset=sym,
-                usd=round(med, 6 if med < 1 else 2),
-                spread_pct=round(spread, 3),
-                sources=sorted(p.source for p in points),
-                asof=datetime.fromtimestamp(ts, tz=timezone.utc),
-            )
-        return verified
+            if data and "price" in data:
+                px = float(data["price"])
+                # Coinbase не возвращает 24h change в /ticker; берём из /stats
+                stats = _http_json(url.replace("/ticker", "/stats"))
+                open_ = float(stats.get("open", px)) if stats else px
+                change_pct = ((px - open_) / open_) * 100 if open_ else 0.0
+                vol = float(stats.get("volume", 0.0)) if stats else 0.0
+                out[tk] = {"price": px, "change_pct": change_pct,
+                           "volume_24h": vol * px, "source": "coinbase"}
+        except Exception as e:  # noqa: BLE001
+            log("market_overview", f"coinbase {tk}: {e}")
+        _throttle("coinbase")
+    return out
 
 
-# --- USD/RUB ----------------------------------------------------------------
+def fetch_metal(symbol: str) -> dict | None:
+    """Yahoo Finance quote по тикеру GC=F/SI=F."""
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote"
+    try:
+        data = _http_json(url, params={"symbols": symbol})
+        res = (data.get("quoteResponse") or {}).get("result") or []
+        if not res:
+            return None
+        q = res[0]
+        price = q.get("regularMarketPrice")
+        prev = q.get("regularMarketPreviousClose") or price
+        if price is None:
+            return None
+        change_pct = ((price - prev) / prev) * 100 if prev else 0.0
+        return {"price": float(price), "change_pct": float(change_pct),
+                "source": "yahoo"}
+    except Exception as e:  # noqa: BLE001
+        log("market_overview", f"yahoo {symbol}: {e}")
+        return None
 
-class FxRate:
-    def __init__(self, http: Http) -> None:
-        self.http = http
 
-    async def fetch(self) -> float | None:
-        try:
+def fetch_fng() -> dict | None:
+    """Alternative.me Crypto Fear & Greed Index."""
+    try:
+        data = _http_json("https://api.alternative.me/fng/?limit=1")
+        if not data or "data" not in data or not data["data"]:
+            return None
+        d = data["data"][0]
+        return {"value": int(d["value"]), "classification": d["value_classification"]}
+    except Exception as e:  # noqa: BLE001
+        log("market_overview", f"fng: {e}")
+        return None
+
+
+# --- Сборка и верификация ---------------------------------------------------
+
+def collect_prices() -> dict[str, dict]:
