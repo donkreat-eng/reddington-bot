@@ -281,7 +281,7 @@ def build_top5_chart(ohlc_by_ticker: dict, out_path: Path) -> None:
     """Render BTC chart — main asset for top5 overview."""
     btc_ohlc = ohlc_by_ticker["BTC"]
     sup, res = adaptive_zones(ohlc_by_ticker["_btc_price"])
-    chartlib.draw_tv_chart(
+    chartlib.generate_chart(
         btc_ohlc, "BTC/USDT",
         (sup * 0.998, sup * 1.005),
         (res * 0.995, res * 1.002),
