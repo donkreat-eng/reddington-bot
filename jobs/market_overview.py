@@ -218,7 +218,6 @@ def fetch_crypto_change(ticker: str) -> dict:
     """24h change and volume. Binance → Bybit → OKX → CoinGecko fallback."""
     symbol = BINANCE_SYMBOL[ticker]
     coin_id = COINGECKO_IDS[ticker]
-    # 1) Binance spot 24hr ticker
     try:
         d = _http_json(f"{BINANCE_BASE}/api/v3/ticker/24hr", {"symbol": symbol})
         return {
@@ -227,9 +226,7 @@ def fetch_crypto_change(ticker: str) -> dict:
             "source": "binance",
         }
     except Exception as e:
-        log("market_overview",
-            f"change {ticker} Binance FAIL: {e}; trying Bybit")
-    # 2) Bybit
+        log("market_overview", f"change {ticker} Binance FAIL: {e}; trying Bybit")
     try:
         ex = _bybit_extras(symbol)
         return {
@@ -238,9 +235,7 @@ def fetch_crypto_change(ticker: str) -> dict:
             "source": "bybit",
         }
     except Exception as e:
-        log("market_overview",
-            f"change {ticker} Bybit FAIL: {e}; trying OKX")
-    # 3) OKX
+        log("market_overview", f"change {ticker} Bybit FAIL: {e}; trying OKX")
     try:
         ex = _okx_extras(symbol)
         return {
@@ -249,9 +244,7 @@ def fetch_crypto_change(ticker: str) -> dict:
             "source": "okx",
         }
     except Exception as e:
-        log("market_overview",
-            f"change {ticker} OKX FAIL: {e}; trying CoinGecko")
-    # 4) CoinGecko (last resort — usually rate-limited)
+        log("market_overview", f"change {ticker} OKX FAIL: {e}; trying CoinGecko")
     try:
         d = _http_json(f"{COINGECKO_BASE}/simple/price",
                        {"ids": coin_id, "vs_currencies": "usd",
@@ -269,10 +262,6 @@ def fetch_crypto_change(ticker: str) -> dict:
 # ─── OHLC for chart ───────────────────────────────────────────────────────────
 
 
-# Map our USDT ticker → Kraken pair aliases. Kraken uses XBT for BTC and
-# prefixes its pairs with X/Z (e.g. XXBTZUSD, XBTUSDT). We try each alias
-# until the API returns a non-empty result, then raise so CoinGecko fallback
-# fires if all aliases fail.
 _KRAKEN_ALIASES = {
     "BTCUSDT": ("XBTUSDT", "XXBTZUSD", "XBTUSD"),
     "ETHUSDT": ("ETHUSDT", "XETHZUSD", "ETHUSD"),
@@ -284,7 +273,7 @@ _KRAKEN_ALIASES = {
 
 def _kraken_ohlc(pair: str, days: int = 7) -> list:
     """Kraken OHLC since N days ago. Tries multiple pair aliases."""
-    since = int((time.time() - days * 86400) - 3600)  # 1h slack to avoid edge
+    since = int((time.time() - days * 86400) - 3600)
     aliases = _KRAKEN_ALIASES.get(pair, (pair,))
     last_err: Exception | None = None
     for alias in aliases:
@@ -312,7 +301,7 @@ def _kraken_ohlc(pair: str, days: int = 7) -> list:
 
 
 def _coingecko_ohlc(coin_id: str, days: int = 7) -> list:
-    """CoinGecko OHLC (4h for days<=1, daily for days>1)."""
+    """CoinGecko OHLC."""
     d = _http_json(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
                    {"vs_currency": "usd", "days": days})
     return [(c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4])) for c in d]
@@ -322,7 +311,6 @@ def fetch_crypto_ohlc(ticker: str, days: int = 7) -> list:
     """BTC OHLC for chart. Binance → Kraken (multi-alias) → CoinGecko."""
     symbol = BINANCE_SYMBOL[ticker]
     coin_id = COINGECKO_IDS[ticker]
-    # 1) Binance
     try:
         d = _http_json(f"{BINANCE_BASE}/api/v3/klines",
                        {"symbol": symbol, "interval": "4h", "limit": days * 6})
@@ -332,14 +320,12 @@ def fetch_crypto_ohlc(ticker: str, days: int = 7) -> list:
         return candles
     except Exception as e:
         log("market_overview", f"ohlc {ticker} Binance FAIL: {e}; trying Kraken")
-    # 2) Kraken (mapping handles aliases internally)
     try:
         candles = _kraken_ohlc(symbol, days)
         log("market_overview", f"ohlc {ticker} source=kraken n={len(candles)}")
         return candles
     except Exception as e:
         log("market_overview", f"ohlc {ticker} Kraken FAIL: {e}; trying CoinGecko")
-    # 3) CoinGecko
     candles = _coingecko_ohlc(coin_id, days)
     log("market_overview", f"ohlc {ticker} source=coingecko n={len(candles)}")
     return candles
@@ -383,10 +369,9 @@ def _okx_long_short(coin: str) -> float | None:
 def fetch_crypto_positional(ticker: str) -> dict:
     """OI USDT, funding %, L/S ratio."""
     symbol = BINANCE_SYMBOL[ticker]
-    coin = ticker  # BTC, ETH, ...
+    coin = ticker
     out: dict = {"oi_usdt": None, "funding": None, "long_short": None}
 
-    # OI + funding: Binance → Bybit → OKX
     try:
         ex = _binance_oi_funding(symbol)
         out["oi_usdt"] = ex["oi_usdt"]
@@ -415,7 +400,6 @@ def fetch_crypto_positional(ticker: str) -> dict:
                 log("market_overview",
                     f"OI/funding {ticker} OKX FAIL: {e3}")
 
-    # L/S ratio: Binance → OKX
     try:
         ratio = _binance_long_short(symbol)
         out["long_short"] = ratio
@@ -450,7 +434,7 @@ def _yahoo_metal(symbol: str) -> dict:
 
 
 def _gold_api_metal(symbol: str) -> dict | None:
-    """gold-api.com fallback (no auth, USD). symbol in {XAU, XAG}."""
+    """gold-api.com fallback (no auth, USD)."""
     try:
         d = _http_json(f"https://api.gold-api.com/price/{symbol}", timeout=10)
         return {"price": float(d["price"]), "change_pct": 0.0}
@@ -483,7 +467,6 @@ def fetch_metal(name: str) -> dict:
 
 
 def fetch_fng() -> int:
-    """Fear & Greed index (0-100)."""
     try:
         d = _http_json("https://api.alternative.me/fng/", {"limit": 1})
         return int(d["data"][0]["value"])
@@ -495,7 +478,6 @@ def fetch_fng() -> int:
 
 
 def verify_post_data(prices: dict, changes: dict) -> str:
-    """Returns 'OK' or 'FAIL: reason'."""
     for t in CRYPTO_TICKERS:
         sp = prices.get(t, {}).get("spread", 99)
         if sp > 1.5:
@@ -511,7 +493,6 @@ def verify_post_data(prices: dict, changes: dict) -> str:
 
 
 def build_caption(prices: dict, changes: dict, fng: int, ts: datetime) -> str:
-    """Compact summary used as Telegram photo caption."""
     ts_str = ts.strftime("%d %b %Y · %H:%M YEKT")
     crypto_lines = []
     for t in CRYPTO_TICKERS:
@@ -559,7 +540,6 @@ def build_caption(prices: dict, changes: dict, fng: int, ts: datetime) -> str:
 
 
 def build_body(prices: dict, changes: dict, positional: dict, fng: int, ts: datetime) -> str:
-    """Long body posted as separate message after the chart photo."""
     ts_str = ts.strftime("%A, %d %B %Y · %H:%M YEKT")
     parts = [
         f"🏛 REDDINGTON · Обзор рынка",
@@ -652,6 +632,36 @@ def fmt_price(x) -> str:
     """fmt_price from lib/post, imported below if present."""
     from lib.post import fmt_price as _fp
     return _fp(x)
+
+
+def fmt_oi(usdt) -> str:
+    """Open interest: $2.51B / $348M / '—'."""
+    if usdt is None:
+        return "—"
+    if usdt >= 1e9:
+        return f"${usdt / 1e9:.2f}B"
+    if usdt >= 1e6:
+        return f"${usdt / 1e6:.1f}M"
+    if usdt >= 1e3:
+        return f"${usdt / 1e3:.1f}K"
+    return f"${usdt:.0f}"
+
+
+def fmt_funding(f) -> str:
+    """Funding rate in %. f is already in percent (e.g. 0.01 = 0.01%)."""
+    if f is None:
+        return "—"
+    sign = "+" if f >= 0 else "−"
+    return f"{sign}{abs(f):.3f}%"
+
+
+def fmt_ls(ratio) -> str:
+    """Long/short ratio: 1.50 / '—'."""
+    if ratio is None:
+        return "—"
+    if ratio >= 1:
+        return f"{ratio:.2f} лонг"
+    return f"{ratio:.2f} шорт"
 
 
 # ─── Chart ───────────────────────────────────────────────────────────────────
