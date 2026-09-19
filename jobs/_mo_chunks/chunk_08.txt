@@ -1,0 +1,31 @@
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        if resp.status != 200:
+            body = resp.read().decode("utf-8", "ignore")
+            raise RuntimeError(f"telegram {resp.status}: {body[:200]}")
+
+
+def main() -> None:
+    setup_logger("market_overview")
+    load_env()
+
+    # 1. Сбор цен
+    prices = collect_prices()
+
+    # 2. Контекст
+    position = build_position_layer(prices)
+    fng = fetch_fng()
+
+    # 3. Тело
+    body = format_body(prices, fng)
+    if position:
+        body += "\n\n" + position
+
+    # 4. Заголовок и публикация
+    dt = datetime.now(YEKT)
+    caption = f"Обзор {dt.strftime('%d.%m.%Y %H:%M')} YEKT"
+    post_pair(caption, body)
+    log("market_overview", "posted OK")
+
+
+if __name__ == "__main__":
+    main()
