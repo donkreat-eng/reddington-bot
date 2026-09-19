@@ -1,218 +1,325 @@
 """13:30 YEKT market overview — BTC/ETH/BNB/SOL/XRP + Gold/Silver с позиционным слоем.
-
-Полностью автономный: 4 источника цены, верификация перед публикацией,
-пересборка при расхождении, retry 3×15 мин при сбоях данных.
+Источники (auto-fallback):
+  price:    Binance → CoinGecko → Kraken → Coinbase (median + spread check)
+  change:   Binance spot → Bybit linear → OKX swap → CoinGecko
+  ohlc:     Binance klines → Kraken OHLC → CoinGecko OHLC
+  OI/fund:  Binance futures → Bybit → OKX (L/S — только Binance)
+  metals:   Yahoo Finance (GC=F, SI=F)
 """
 from __future__ import annotations
 
+import json
 import os
-import sys
+import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import requests
+from lib.chart import generate_chart
+from lib.common import load_env, log, post_dir, setup_logger
+from lib.publish import post_pair
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from lib import chart as chartlib  # noqa: E402
-from lib.common import load_env, log, post_dir, setup_logger  # noqa: E402
-from lib.post import fmt_price, fmt_change, fmt_volume  # noqa: E402
-from lib.publish import post_pair  # noqa: E402
-
-YEKT = ZoneInfo("Asia/Yekaterinburg")
-
-CRYPTO_TICKERS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
-BINANCE_SYMBOL = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT",
-                  "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
-METAL_SYMBOLS = {"Gold": "GC=F", "Silver": "SI=F"}
-COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
-                 "SOL": "solana", "XRP": "ripple"}
-
-PRICE_SOURCES = ["binance", "coingecko", "kraken", "coinbase"]
-THROTTLE = {"binance": 0.25, "coingecko": 2.0, "kraken": 0.5, "coinbase": 0.5}
+# ─── Constants ───
 BINANCE_BASE = "https://api.binance.com"
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-KRAKEN_BASE = "https://api.kraken.com/0/public"
-COINBASE_BASE = "https://api.coinbase.com/v2"
-BYBIT_BASE = "https://api.bybit.com/v5/market"
-KRAKEN_INTERVAL = {4 * 3600: 240}  # 4h interval in minutes for Kraken OHLC
+COINBASE_BASE = "https://api.exchange.coinbase.com"
+BYBIT_BASE = "https://api.bybit.com"
+OKX_BASE = "https://www.okx.com"
 
-# Cache for Bybit tickers (single batch call is much cheaper than 5 separate calls)
+KRAKEN_INTERVAL = 240
 _BYBIT_CACHE: dict = {"ts": 0.0, "data": {}}
-_BYBIT_CACHE_TTL = 30.0  # seconds
+_BYBIT_CACHE_TTL = 30.0
+_OKX_CACHE: dict = {"ts": 0.0, "data": {}}
+_OKX_CACHE_TTL = 30.0
+
+OKX_SWAP_INST = {
+    "BTCUSDT": "BTC-USDT-SWAP",
+    "ETHUSDT": "ETH-USDT-SWAP",
+    "BNBUSDT": "BNB-USDT-SWAP",
+    "SOLUSDT": "SOL-USDT-SWAP",
+    "XRPUSDT": "XRP-USDT-SWAP",
+}
+
+BINANCE_SYMBOL = {
+    "BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT",
+    "SOL": "SOLUSDT", "XRP": "XRPUSDT",
+}
+COINGECKO_IDS = {
+    "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
+    "SOL": "solana", "XRP": "ripple",
+}
+TICKERS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
 
 
-def _http_json(url: str, params: dict | None = None, timeout: int = 10):
-    r = requests.get(url, params=params or {}, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+# ─── HTTP helpers ───
+def _http_json(url: str, params: dict | None = None, timeout: int = 10,
+               headers: dict | None = None) -> dict | list:
+    if params:
+        qs = urllib.parse.urlencode(params)
+        url = f"{url}?{qs}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "market_overview/1.0",
+        "Accept": "application/json",
+        **(headers or {}),
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body) if body else {}
 
 
-def _binance_price(symbol: str) -> tuple[float, str]:
-    data = _http_json(f"{BINANCE_BASE}/api/v3/ticker/24hr", {"symbol": symbol})
-    return float(data["lastPrice"]), "binance"
+def _http_get(url: str, timeout: int = 10, headers: dict | None = None) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "market_overview/1.0",
+        "Accept": "application/json",
+        **(headers or {}),
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
 
 
-def _coingecko_price(coin_id: str) -> tuple[float, str]:
-    data = _http_json(f"{COINGECKO_BASE}/simple/price",
-                      {"ids": coin_id, "vs_currencies": "usd"})
-    return float(data[coin_id]["usd"]), "coingecko"
+# ─── Spot prices (4 sources with median) ───
+def _binance_price(symbol: str) -> float | None:
+    try:
+        d = _http_json(f"{BINANCE_BASE}/api/v3/ticker/price",
+                       {"symbol": symbol})
+        return float(d["price"])
+    except Exception as e:
+        log("market_overview", f"price {symbol} binance FAIL: {e}")
+        return None
 
 
-def _kraken_price(symbol: str) -> tuple[float, str]:
-    pair = {"BTCUSDT": "XBTUSDT", "ETHUSDT": "ETHUSDT", "BNBUSDT": "BNBUSDT",
-            "SOLUSDT": "SOLUSDT", "XRPUSDT": "XRPUSDT"}[symbol]
-    data = _http_json(f"{KRAKEN_BASE}/Ticker", {"pair": pair})
-    key = next(k for k in data["result"] if k.startswith(pair[:3]))
-    return float(data["result"][key]["c"][0]), "kraken"
+def _coingecko_price(coin_id: str) -> float | None:
+    try:
+        d = _http_json("https://api.coingecko.com/api/v3/simple/price",
+                       {"ids": coin_id, "vs_currencies": "usd"})
+        return float(d[coin_id]["usd"])
+    except Exception as e:
+        log("market_overview", f"price {coin_id} coingecko FAIL: {e}")
+        return None
 
 
-def _coinbase_price(symbol: str) -> tuple[float, str]:
-    coin = symbol.replace("USDT", "")
-    data = _http_json(f"{COINBASE_BASE}/prices/{coin}-USD/spot")
-    return float(data["data"]["amount"]), "coinbase"
+def _kraken_price(symbol: str) -> float | None:
+    pair = symbol.replace("USDT", "USD") if symbol.endswith("USDT") else symbol
+    try:
+        d = _http_json("https://api.kraken.com/0/public/Ticker",
+                       {"pair": pair})
+        key = next(iter(d.get("result", {})), None)
+        if key:
+            return float(d["result"][key]["c"][0])
+    except Exception as e:
+        log("market_overview", f"price {symbol} kraken FAIL: {e}")
+    return None
+
+
+def _coinbase_price(symbol: str) -> float | None:
+    pair = symbol.replace("USDT", "USD") if symbol.endswith("USDT") else symbol
+    try:
+        d = _http_json(f"{COINBASE_BASE}/products/{pair}/ticker")
+        return float(d["price"])
+    except Exception as e:
+        log("market_overview", f"price {symbol} coinbase FAIL: {e}")
+        return None
 
 
 def fetch_crypto_price(ticker: str) -> dict:
-    """Fetch crypto price from 4 sources with throttling; return median + spread."""
     symbol = BINANCE_SYMBOL[ticker]
     coin_id = COINGECKO_IDS[ticker]
-
-    sources = {
-        "binance": lambda: _binance_price(symbol),
-        "coingecko": lambda: _coingecko_price(coin_id),
-        "kraken": lambda: _kraken_price(symbol),
-        "coinbase": lambda: _coinbase_price(symbol),
-    }
-
-    results: list[tuple[float, str]] = []
-    last_err = None
-    for name in PRICE_SOURCES:
-        try:
-            time.sleep(THROTTLE[name])
-            v, src = sources[name]()
-            results.append((v, src))
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            log("market_overview", f"{ticker} {name} FAIL: {e}")
-
-    if len(results) < 2:
-        raise RuntimeError(f"{ticker}: only {len(results)} sources OK ({last_err})")
-
-    prices = [p for p, _ in results]
-    prices_sorted = sorted(prices)
-    median = prices_sorted[len(prices_sorted) // 2]
-    spread_pct = (max(prices) - min(prices)) / median * 100
-    return {
-        "ticker": ticker,
-        "price": median,
-        "spread_pct": spread_pct,
-        "n_sources": len(results),
-        "sources": results,
-    }
+    prices: list[float] = []
+    src_names: list[str] = []
+    for src_name, fn in (
+        ("binance", lambda: _binance_price(symbol)),
+        ("coingecko", lambda: _coingecko_price(coin_id)),
+        ("kraken", lambda: _kraken_price(symbol)),
+        ("coinbase", lambda: _coinbase_price(symbol)),
+    ):
+        p = fn()
+        if p is not None:
+            prices.append(p)
+            src_names.append(src_name)
+    if not prices:
+        raise RuntimeError(f"all price sources failed for {ticker}")
+    median = statistics.median(prices)
+    if len(prices) >= 2:
+        spread = (max(prices) - min(prices)) / median * 100
+    else:
+        spread = 0.0
+    return {"ticker": ticker, "price": median, "spread": spread,
+            "sources": src_names, "n_sources": len(prices)}
 
 
-def _bybit_tickers_cached() -> dict:
-    """Fetch all Bybit linear tickers once, cache for 30s."""
+# ─── Bybit V5 helpers ───
+def _bybit_tickers_cached(force: bool = False) -> dict:
+    """Return dict of linear tickers keyed by symbol (e.g. BTCUSDT)."""
     now = time.time()
-    if _BYBIT_CACHE["data"] and (now - _BYBIT_CACHE["ts"]) < _BYBIT_CACHE_TTL:
+    if not force and (now - _BYBIT_CACHE["ts"]) < _BYBIT_CACHE_TTL \
+            and _BYBIT_CACHE["data"]:
         return _BYBIT_CACHE["data"]
-    data = _http_json(f"{BYBIT_BASE}/tickers", {"category": "linear"})
-    out = {item["symbol"]: item for item in data["result"]["list"]}
+    data = {}
+    for cat in ("linear",):
+        try:
+            d = _http_json(f"{BYBIT_BASE}/v5/market/tickers",
+                           {"category": cat})
+            for row in d.get("result", {}).get("list", []):
+                data[row["symbol"]] = row
+        except Exception as e:
+            log("market_overview", f"bybit tickers {cat} FAIL: {e}")
     _BYBIT_CACHE["ts"] = now
-    _BYBIT_CACHE["data"] = out
-    return out
+    _BYBIT_CACHE["data"] = data
+    return data
 
 
 def _bybit_extras(symbol: str) -> dict:
-    """Bybit V5: OI in USDT, funding rate (decimal → percent), 24h change %, turnover.
-    No auth required for /v5/market/tickers (public).
-    """
-    lst = _bybit_tickers_cached()
-    item = lst.get(symbol)
-    if not item:
-        raise RuntimeError(f"Bybit symbol {symbol} not found")
-    return {
-        "oi_usdt": float(item.get("openInterestValue") or 0),
-        "funding": float(item.get("fundingRate") or 0) * 100,
-        "change_24h": float(item.get("price24hPcnt") or 0) * 100,
-        "turnover_24h": float(item.get("turnover24h") or 0),
-    }
+    """Extract: change_24h %, turnover_24h USDT, funding %, oi_usdt."""
+    tickers = _bybit_tickers_cached()
+    if symbol not in tickers:
+        raise RuntimeError(f"bybit {symbol} not in tickers")
+    row = tickers[symbol]
+    last = float(row["lastPrice"])
+    prev24 = float(row["prevPrice24h"])
+    turnover = float(row["turnover24h"])
+    change = (last - prev24) / prev24 * 100 if prev24 else 0.0
+    funding = float(row.get("fundingRate", 0)) * 100
+    oi = float(row.get("openInterest", 0))
+    oi_usdt = oi * last
+    return {"change_24h": change, "turnover_24h": turnover,
+            "funding": funding, "oi_usdt": oi_usdt, "price": last}
 
 
+# ─── OKX V5 helpers (no auth, works on Cloudflare-blocked IPs) ───
+def _okx_swap(inst_id: str) -> dict:
+    """GET /api/v5/market/ticker?instId=... — last, open24h, volCcy24h."""
+    d = _http_json(f"{OKX_BASE}/api/v5/market/ticker",
+                   {"instId": inst_id})
+    rows = d.get("data", [])
+    if not rows:
+        raise RuntimeError(f"okx ticker empty for {inst_id}")
+    return rows[0]
+
+
+def _okx_funding(inst_id: str) -> float:
+    """Return fundingRate as percent."""
+    d = _http_json(f"{OKX_BASE}/api/v5/public/funding-rate",
+                   {"instId": inst_id})
+    rows = d.get("data", [])
+    if not rows:
+        raise RuntimeError(f"okx funding empty for {inst_id}")
+    return float(rows[0]["fundingRate"]) * 100
+
+
+def _okx_oi(inst_id: str, mark_price: float) -> float:
+    """Return OI in USDT = oiCcy * mark_price."""
+    d = _http_json(f"{OKX_BASE}/api/v5/public/open-interest",
+                   {"instId": inst_id})
+    rows = d.get("data", [])
+    if not rows:
+        raise RuntimeError(f"okx oi empty for {inst_id}")
+    oiCcy = float(rows[0]["oiCcy"])
+    return oiCcy * mark_price
+
+
+def _okx_extras(symbol: str) -> dict:
+    """Extract: change_24h %, turnover_24h USDT, funding %, oi_usdt."""
+    inst_id = OKX_SWAP_INST.get(symbol)
+    if not inst_id:
+        raise RuntimeError(f"okx no inst for {symbol}")
+    t = _okx_swap(inst_id)
+    last = float(t["last"])
+    open24 = float(t["open24h"])
+    vol_ccy = float(t.get("volCcy24h", 0))  # volume in base ccy
+    # OKX volCcy24h is base ccy (e.g. BTC), volCcy24hQuote missing in ticker — use last * volCcy
+    turnover = vol_ccy * last
+    change = (last - open24) / open24 * 100 if open24 else 0.0
+    funding = _okx_funding(inst_id)
+    oi_usdt = _okx_oi(inst_id, last)
+    return {"change_24h": change, "turnover_24h": turnover,
+            "funding": funding, "oi_usdt": oi_usdt, "price": last}
+
+
+# ─── 24h change + volume ───
 def fetch_crypto_change(ticker: str) -> dict:
-    """24h change % + volume. Binance → Bybit → CoinGecko."""
+    """Binance → Bybit → OKX → CoinGecko."""
     symbol = BINANCE_SYMBOL[ticker]
-    # 1. Binance spot ticker
+    # 1. Binance spot 24hr ticker (gives %change + quoteVolume in USDT)
     try:
-        data = _http_json(f"{BINANCE_BASE}/api/v3/ticker/24hr", {"symbol": symbol})
-        return {
-            "change_24h": float(data["priceChangePercent"]),
-            "volume_24h": float(data["quoteVolume"]),
-            "source": "binance",
-        }
+        d = _http_json(f"{BINANCE_BASE}/api/v3/ticker/24hr",
+                       {"symbol": symbol})
+        return {"change_24h": float(d["priceChangePercent"]),
+                "volume_24h": float(d["quoteVolume"]),
+                "source": "binance"}
     except Exception as e:
         log("market_overview",
             f"change {ticker} Binance FAIL: {e}; trying Bybit")
     # 2. Bybit linear ticker (gives % change + turnover in USDT)
     try:
         ex = _bybit_extras(symbol)
-        return {
-            "change_24h": ex["change_24h"],
-            "volume_24h": ex["turnover_24h"],
-            "source": "bybit",
-        }
+        return {"change_24h": ex["change_24h"],
+                "volume_24h": ex["turnover_24h"],
+                "source": "bybit"}
     except Exception as e:
         log("market_overview",
-            f"change {ticker} Bybit FAIL: {e}; trying CoinGecko")
-    # 3. CoinGecko (often 429, last resort)
+            f"change {ticker} Bybit FAIL: {e}; trying OKX")
+    # 3. OKX swap ticker (no auth, works where Bybit 403 on Cloudflare-blocked IPs)
     try:
-        data = _http_json(
-            f"{COINGECKO_BASE}/coins/{COINGECKO_IDS[ticker]}",
-            {"localization": "false", "tickers": "false",
-             "community_data": "false", "developer_data": "false"},
-            timeout=10,
-        )
-        md = data.get("market_data", {})
-        change = md.get("price_change_percentage_24h", 0.0) or 0.0
-        vol = md.get("total_volume", {}).get("usd", 0.0) or 0.0
-        return {
-            "change_24h": float(change), "volume_24h": float(vol),
-            "source": "coingecko",
-        }
-    except Exception as e2:
-        log("market_overview", f"change {ticker} CoinGecko FAIL: {e2}")
+        ex = _okx_extras(symbol)
+        return {"change_24h": ex["change_24h"],
+                "volume_24h": ex["turnover_24h"],
+                "source": "okx"}
+    except Exception as e:
+        log("market_overview",
+            f"change {ticker} OKX FAIL: {e}; trying CoinGecko")
+    # 4. CoinGecko (last resort; no turnover)
+    cg_id = COINGECKO_IDS[ticker]
+    try:
+        d = _http_json("https://api.coingecko.com/api/v3/simple/price",
+                       {"ids": cg_id,
+                        "vs_currencies": "usd",
+                        "include_24hr_change": "true"})
+        chg = float(d[cg_id].get("usd_24h_change", 0))
+        return {"change_24h": chg, "volume_24h": 0.0, "source": "coingecko"}
+    except Exception as e:
+        log("market_overview", f"change {ticker} CoinGecko FAIL: {e}")
         return {"change_24h": 0.0, "volume_24h": 0.0, "source": "none"}
 
 
-def _kraken_ohlc(symbol: str, minutes: int = 240, days: int = 7) -> list:
-    pair = {"BTCUSDT": "XBTUSDT", "ETHUSDT": "ETHUSDT", "BNBUSDT": "BNBUSDT",
-            "SOLUSDT": "SOLUSDT", "XRPUSDT": "XRPUSDT"}[symbol]
-    data = _http_json(f"{KRAKEN_BASE}/OHLC", {"pair": pair, "interval": minutes})
-    candles = data["result"][pair]
+# ─── OHLC fallback chain ───
+def _kraken_ohlc(symbol: str, minutes: int, days: int) -> list[tuple[int, float, float, float, float]]:
+    pair = symbol.replace("USDT", "USD") if symbol.endswith("USDT") else symbol
     cutoff = int(time.time()) - days * 86400
-    out = []
-    for c in candles:
-        if c[0] >= cutoff:
-            out.append((c[0] * 1000, float(c[1]), float(c[2]),
-                        float(c[3]), float(c[4])))
-    return out
+    candles: list[tuple[int, float, float, float, float]] = []
+    since = cutoff
+    while True:
+        d = _http_json("https://api.kraken.com/0/public/OHLC",
+                       {"pair": pair, "interval": minutes, "since": since})
+        key = next((k for k in d.get("result", {}) if k != "last"), None)
+        if not key:
+            break
+        rows = d["result"][key]
+        for r in rows:
+            ts, o, h, l, c = r[:5]
+            if ts < cutoff:
+                continue
+            candles.append((int(ts) * 1000, float(o), float(h), float(l), float(c)))
+        last_ts = int(rows[-1][0])
+        if last_ts >= int(time.time()) - minutes * 60:
+            break
+        since = last_ts
+        if len(rows) < 50:
+            break
+    return candles
 
 
-def _coingecko_ohlc(coin_id: str, days: int = 7) -> list:
-    data = _http_json(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
-                      {"vs_currency": "usd", "days": days})
-    return [(c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]))
-            for c in data]
+def _coingecko_ohlc(coin_id: str, days: int) -> list[tuple[int, float, float, float, float]]:
+    d = _http_json(f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc",
+                   {"vs_currency": "usd", "days": str(days)})
+    return [(int(t), float(o), float(h), float(l), float(c))
+            for t, o, h, l, c in d]
 
 
-def fetch_crypto_ohlc(ticker: str, days: int = 7) -> list:
+def fetch_crypto_ohlc(ticker: str, days: int = 7, limit: int = 42) -> list[tuple[int, float, float, float, float]]:
     """4h OHLC for chart. Binance → Kraken → CoinGecko fallback."""
     symbol = BINANCE_SYMBOL[ticker]
-    limit = days * 6  # 6 candles per day at 4h
     try:
         raw = _http_json(f"{BINANCE_BASE}/api/v3/klines",
                          {"symbol": symbol, "interval": "4h", "limit": limit})
@@ -233,8 +340,9 @@ def fetch_crypto_ohlc(ticker: str, days: int = 7) -> list:
     return candles
 
 
+# ─── OI / funding / L/S ───
 def fetch_crypto_positional(ticker: str) -> dict:
-    """OI, funding, L/S ratio. Binance → Bybit fallback for OI+fee; L/S only Binance."""
+    """OI, funding, L/S ratio. Binance → Bybit → OKX; L/S only Binance."""
     symbol = BINANCE_SYMBOL[ticker]
     out: dict = {}
 
@@ -253,8 +361,14 @@ def fetch_crypto_positional(ticker: str) -> dict:
             ex = _bybit_extras(symbol)
             out["oi_usdt"] = ex["oi_usdt"]
         except Exception as e2:
-            log("market_overview", f"OI {ticker} Bybit FAIL: {e2}")
-            out["oi_usdt"] = None
+            log("market_overview",
+                f"OI {ticker} Bybit FAIL: {e2}; trying OKX")
+            try:
+                ex = _okx_extras(symbol)
+                out["oi_usdt"] = ex["oi_usdt"]
+            except Exception as e3:
+                log("market_overview", f"OI {ticker} OKX FAIL: {e3}")
+                out["oi_usdt"] = None
 
     # ─── Funding rate ───
     try:
@@ -267,8 +381,14 @@ def fetch_crypto_positional(ticker: str) -> dict:
             ex = _bybit_extras(symbol)
             out["funding"] = ex["funding"]
         except Exception as e2:
-            log("market_overview", f"funding {ticker} Bybit FAIL: {e2}")
-            out["funding"] = None
+            log("market_overview",
+                f"funding {ticker} Bybit FAIL: {e2}; trying OKX")
+            try:
+                ex = _okx_extras(symbol)
+                out["funding"] = ex["funding"]
+            except Exception as e3:
+                log("market_overview", f"funding {ticker} OKX FAIL: {e3}")
+                out["funding"] = None
 
     # ─── Long/Short ratio (Binance-only — Bybit V5 requires auth for this) ───
     try:
@@ -282,284 +402,231 @@ def fetch_crypto_positional(ticker: str) -> dict:
     return out
 
 
-def fetch_metal(name: str) -> dict:
-    """Fetch metal price from Yahoo Finance (public endpoint)."""
-    symbol = METAL_SYMBOLS[name]
-    headers = {"User-Agent": "Mozilla/5.0"}
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    data = requests.get(url, params={"interval": "1d", "range": "5d"},
-                        headers=headers, timeout=10).json()
-    res = data["chart"]["result"][0]
-    meta = res["meta"]
-    price = meta["regularMarketPrice"]
-    prev = meta.get("chartPreviousClose", meta.get("previousClose", price))
-    return {
-        "name": name,
-        "price": float(price),
-        "change_pct": (float(price) - float(prev)) / float(prev) * 100,
-    }
+# ─── Metals via Yahoo Finance ───
+def _yahoo_quote(symbol: str) -> dict:
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+           "?interval=1d&range=5d")
+    d = _http_json(url)
+    r = d["chart"]["result"][0]
+    meta = r["meta"]
+    closes = [float(c) for c in r["indicators"]["quote"][0].get("close", [])
+              if c is not None]
+    price = float(meta.get("regularMarketPrice") or (closes[-1] if closes else 0))
+    prev = float(meta.get("chartPreviousClose") or (closes[-2] if len(closes) > 1 else price))
+    change = (price - prev) / prev * 100 if prev else 0.0
+    return {"price": price, "change_24h": change}
 
 
-def fmt_oi(oi: float | None) -> str:
-    if oi is None:
-        return "n/a"
-    if oi > 1e9:
-        return f"${oi / 1e9:.2f}B"
-    if oi > 1e6:
-        return f"${oi / 1e6:.1f}M"
-    return f"${oi:,.0f}"
+def fetch_metal(symbol: str, name: str) -> dict:
+    try:
+        q = _yahoo_quote(symbol)
+        return {"name": name, "price": q["price"], "change_24h": q["change_24h"]}
+    except Exception as e:
+        log("market_overview", f"metal {name} ({symbol}) FAIL: {e}")
+        return {"name": name, "price": 0.0, "change_24h": 0.0}
 
 
-def fmt_funding(f: float | None) -> str:
-    if f is None:
-        return "n/a"
-    sign = "+" if f >= 0 else ""
-    return f"{sign}{f:.3f}%"
+# ─── Fear & Greed Index ───
+def fetch_fng() -> dict:
+    try:
+        d = _http_json("https://api.alternative.me/fng/",
+                       {"limit": 1, "format": "json"})
+        e = d["data"][0]
+        return {"value": int(e["value"]), "label": e["value_classification"]}
+    except Exception as e:
+        log("market_overview", f"F&G FAIL: {e}")
+        return {"value": 0, "label": "n/a"}
 
 
-def fmt_ls(ls: float | None) -> str:
-    if ls is None:
-        return "n/a"
-    pct = ls / (1 + ls) * 100
-    return f"{pct:.0f}% лонг"
+# ─── Verification ───
+def verify_post_data(prices: dict[str, dict]) -> str:
+    """L1: every ticker has ≥1 source; L2: ≥2 sources and spread ≤3%."""
+    for t, p in prices.items():
+        n = p.get("n_sources", 0)
+        spread = p.get("spread", 999)
+        if n < 1:
+            return f"L1 FAIL: {t} has no sources"
+        if n < 2:
+            log("market_overview", f"L2 WARN: {t} only {n} source(s)")
+        elif spread > 3.0:
+            return f"L2 FAIL: {t} spread {spread:.2f}% > 3%"
+    return "OK"
 
 
-def adaptive_zones(price: float) -> tuple[float, float]:
+# ─── Formatting ───
+def fmt_price(p: float) -> str:
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 1:
+        return f"{p:.2f}"
+    return f"{p:.4f}"
+
+
+def fmt_chg(c: float) -> str:
+    sign = "+" if c >= 0 else ""
+    return f"{sign}{c:.2f}%"
+
+
+def fmt_vol(v: float) -> str:
+    if v >= 1e9:
+        return f"${v/1e9:.2f}B"
+    if v >= 1e6:
+        return f"${v/1e6:.0f}M"
+    if v >= 1e3:
+        return f"${v/1e3:.0f}K"
+    return f"${v:.0f}"
+
+
+def fmt_oi(v: float | None) -> str:
+    if v is None:
+        return "—"
+    return fmt_vol(v)
+
+
+def adaptive_zones(price: float) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return (support_range, resistance_range) adaptive to price magnitude."""
+    if price >= 10000:
+        span = price * 0.025
+        return (price - span * 1.5, price - span * 0.5), \
+               (price + span * 0.5, price + span * 1.5)
     if price >= 1000:
-        sup = round(price * 0.97, 2)
-        res = round(price * 1.03, 2)
-    elif price >= 10:
-        sup = round(price * 0.95, 2)
-        res = round(price * 1.05, 2)
-    elif price >= 1:
-        sup = round(price * 0.93, 2)
-        res = round(price * 1.07, 2)
-    else:
-        sup = round(price * 0.88, 4)
-        res = round(price * 1.12, 4)
-    return sup, res
+        span = price * 0.030
+        return (price - span * 1.5, price - span * 0.5), \
+               (price + span * 0.5, price + span * 1.5)
+    if price >= 100:
+        span = price * 0.035
+        return (price - span * 1.5, price - span * 0.5), \
+               (price + span * 0.5, price + span * 1.5)
+    if price >= 10:
+        span = price * 0.040
+        return (price - span * 1.5, price - span * 0.5), \
+               (price + span * 0.5, price + span * 1.5)
+    if price >= 1:
+        span = price * 0.045
+        return (price - span * 1.5, price - span * 0.5), \
+               (price + span * 0.5, price + span * 1.5)
+    span = price * 0.06
+    return (price - span * 1.5, price - span * 0.5), \
+           (price + span * 0.5, price + span * 1.5)
 
 
-def build_top5_chart(ohlc_by_ticker: dict, out_path: Path) -> None:
-    """Render BTC chart — main asset for top5 overview."""
-    btc_ohlc = ohlc_by_ticker["BTC"]
-    sup, res = adaptive_zones(ohlc_by_ticker["_btc_price"])
-    chartlib.generate_chart(
-        btc_ohlc, "BTC/USDT",
-        (sup * 0.998, sup * 1.005),
-        (res * 0.995, res * 1.002),
-        str(out_path),
-    )
+# ─── Chart ───
+def build_top5_chart(ohlc: list[tuple[int, float, float, float, float]],
+                     ticker: str, price: float,
+                     support: tuple[float, float],
+                     resistance: tuple[float, float],
+                     output: Path) -> Path:
+    return generate_chart(ohlc, ticker, support, resistance, str(output))
 
 
-def build_caption(prices: dict, changes: dict, ts: datetime) -> str:
-    parts = ["🏛 <b>REDDINGTON · Топ-5 + Металлы</b>",
-             f"_{ts.strftime('%d %b %Y · %H:%M')} YEKT_",
-             ""]
-    parts.append("📊 <b>Крипто (24ч)</b>")
-    for t in CRYPTO_TICKERS:
-        p = prices[t]["price"]
-        ch = changes[t]["change_24h"]
-        arrow = "🟢" if ch >= 0 else "🔴"
-        parts.append(f"  {arrow} <b>{t}</b> · ${fmt_price(p)} · {fmt_change(ch)}")
-    parts.append("")
-    parts.append("🥇 <b>Металлы</b>")
-    parts.append(f"  🟡 <b>Gold</b> · ${fmt_price(prices['Gold']['price'])} · "
-                 f"{fmt_change(prices['Gold']['change_pct'])}")
-    parts.append(f"  ⚪ <b>Silver</b> · ${fmt_price(prices['Silver']['price'])} · "
-                 f"{fmt_change(prices['Silver']['change_pct'])}")
-    parts.append("")
-    parts.append("🎯 Зоны BTC (адаптивные)")
-    sup, res = adaptive_zones(prices["BTC"]["price"])
-    parts.append(f"  Поддержка: ${fmt_price(sup)}")
-    parts.append(f"  Сопротивление: ${fmt_price(res)}")
-    return "\n".join(parts)
+# ─── Caption + body ───
+def build_caption(date_str: str) -> str:
+    return (f"📊 Обзор рынка {date_str} YEKT\n"
+            f"Крипто + Металлы + Позиционный слой")
 
 
-def build_body(prices: dict, changes: dict, positional: dict,
-               fng_value: int | None, ts: datetime) -> str:
-    lines = ["🏛 <b>REDDINGTON · Обзор рынка</b>",
-             f"<i>{ts.strftime('%A, %d %B %Y · %H:%M')} YEKT</i>",
-             ""]
-
-    lines.append("📈 <b>Сводка по активам</b>")
-    lines.append("<pre>")
-    lines.append(f"{'Актив':<8} {'Цена':>11} {'24ч':>7} {'OI':>9} {'Funding':>9} {'L/S':>8}")
-    lines.append("─" * 60)
-    for t in CRYPTO_TICKERS:
-        p = prices[t]["price"]
-        ch = changes[t]["change_24h"]
+def build_body(prices: dict[str, dict], changes: dict[str, dict],
+               positional: dict[str, dict], metals: dict[str, dict],
+               fng: dict, verify: str) -> str:
+    lines: list[str] = []
+    lines.append("📈 <b>Топ-5 + Металлы — Технический + Позиционный слой</b>")
+    lines.append("")
+    # Crypto section
+    lines.append("<b>Крипто (медиана из 4 источников)</b>")
+    for t in TICKERS:
+        p = prices.get(t, {})
+        c = changes.get(t, {})
         pos = positional.get(t, {})
-        arrow = "▲" if ch >= 0 else "▼"
+        chg = c.get("change_24h", 0)
+        src = c.get("source", "?")
         lines.append(
-            f"{t:<8} ${p:>10,.2f} {arrow}{abs(ch):>5.2f}% "
-            f"{fmt_oi(pos.get('oi_usdt')):>9} {fmt_funding(pos.get('funding')):>9} "
-            f"{fmt_ls(pos.get('long_short')):>8}"
+            f"• <b>{t}/USDT</b> ${fmt_price(p.get('price', 0))} "
+            f"{fmt_chg(chg)} "
+            f"OI {fmt_oi(pos.get('oi_usdt'))} "
+            f"fund {pos.get('funding') if pos.get('funding') is not None else '—'}%"
+            f"  (src: {src}, n={p.get('n_sources', 0)})"
         )
-    lines.append("─" * 60)
-    lines.append(f"{'Gold':<8} ${prices['Gold']['price']:>10,.2f} "
-                 f"{prices['Gold']['change_pct']:>+6.2f}%")
-    lines.append(f"{'Silver':<8} ${prices['Silver']['price']:>10,.2f} "
-                 f"{prices['Silver']['change_pct']:>+6.2f}%")
-    lines.append("</pre>")
     lines.append("")
-
-    if fng_value is not None:
-        emoji = "🟢" if fng_value >= 55 else ("🔴" if fng_value <= 45 else "🟡")
-        lines.append(f"🌡 <b>Fear &amp; Greed:</b> {emoji} {fng_value}/100")
-        lines.append("")
-
-    lines.append("🔍 <b>Что значат цифры</b>")
-    btc = prices["BTC"]
-    btc_pos = positional.get("BTC", {})
-    fr = btc_pos.get("funding")
-    ls = btc_pos.get("long_short")
-
-    if fr is not None and abs(fr) > 0.05:
-        side = "перегрет лонг" if fr > 0 else "перегрет шорт"
-        lines.append(f"  • BTC funding {fmt_funding(fr)} → {side}, "
-                     f"риск коррекции в обратную сторону")
-    else:
-        lines.append("  • BTC funding в нейтральной зоне — рынок сбалансирован")
-
-    if ls is not None:
-        ls_pct = ls / (1 + ls) * 100
-        if ls_pct > 60:
-            lines.append(f"  • {ls_pct:.0f}% лонгов → толпа в лонге, "
-                         f"осторожно с шорт-идеями")
-        elif ls_pct < 40:
-            lines.append(f"  • Только {ls_pct:.0f}% лонгов → "
-                         f"контртрендовые шорты рискованны")
-        else:
-            lines.append(f"  • L/S {ls_pct:.0f}% лонг — баланс")
-
-    oi_chg = btc_pos.get("oi_usdt")
-    if oi_chg is not None:
-        if oi_chg > 5e9:
-            lines.append(f"  • OI ${oi_chg / 1e9:.1f}B — высокий интерес, "
-                         f"движения будут резкими")
-        else:
-            lines.append(f"  • OI ${oi_chg / 1e9:.2f}B — спокойное состояние")
-
+    # Metals section
+    lines.append("<b>Металлы (Yahoo)</b>")
+    for sym, m in metals.items():
+        lines.append(
+            f"• <b>{m.get('name', sym)}</b> ${fmt_price(m.get('price', 0))} "
+            f"{fmt_chg(m.get('change_24h', 0))}"
+        )
     lines.append("")
-    lines.append("⚙️ <b>Кластеры (BTC)</b>")
-    sup, res = adaptive_zones(btc["price"])
-    lines.append(f"  • Поддержка ${fmt_price(sup)} — зона покупки на откате")
-    lines.append(f"  • Сопротивление ${fmt_price(res)} — зона фиксации прибыли")
-    mid = (sup + res) / 2
-    lines.append(f"  • Середина диапазона ${fmt_price(mid)} — точка равновесия")
+    # Sentiment
+    lines.append(f"<b>Сентимент:</b> Fear & Greed = "
+                 f"{fng.get('value', 0)} ({fng.get('label', 'n/a')})")
     lines.append("")
-
-    lines.append("🧭 <b>Что смотреть до конца недели</b>")
-    lines.append("  • Реакция BTC на сопротивление — пробой = продолжение")
-    lines.append("  • Закрытие недели выше/ниже $80K задаст тон фьючерсам")
-    lines.append("  • ETH/BTC ratio — слабость эфира = risk-off в альты")
-    lines.append("  • Золото: $4 400 — психологический уровень")
+    # Verification
+    lines.append(f"<b>Verification:</b> {verify}")
     lines.append("")
-
-    lines.append("<i>Автопост · проверка данных из 4 источников · 13:30 YEKT</i>")
+    lines.append("<i>Источники: Binance/CoinGecko/Kraken/Coinbase (price), "
+                 "Bybit/OKX/CoinGecko (change), Binance/Bybit/OKX (OI/funding), "
+                 "Yahoo (metals).</i>")
     return "\n".join(lines)
 
 
-def fetch_fng() -> int | None:
-    try:
-        data = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()
-        return int(data["data"][0]["value"])
-    except Exception as e:  # noqa: BLE001
-        log("market_overview", f"F&G FAIL: {e}")
-        return None
+# ─── Main ───
+def main() -> None:
+    setup_logger("market_overview")
+    log("market_overview", "start @ " +
+        datetime.now(timezone(timedelta(hours=5))).isoformat(timespec="seconds"))
 
+    # Step 1: fetch prices in parallel (4 sources each)
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        price_futs = {t: pool.submit(fetch_crypto_price, t) for t in TICKERS}
+        prices = {t: f.result() for t, f in price_futs.items()}
+        for t, p in prices.items():
+            log("market_overview",
+                f"{t} ${fmt_price(p['price'])} spread={p['spread']:.3f}% n={p['n_sources']}")
 
-def verify_post_data(prices: dict) -> tuple[bool, str]:
-    """L1+L2 verification: freshness + cross-source agreement."""
-    issues = []
-    for t in CRYPTO_TICKERS:
-        info = prices[t]
-        if info["n_sources"] < 2:
-            issues.append(f"{t}: only {info['n_sources']} sources")
-        elif info["spread_pct"] > 3:
-            issues.append(f"{t}: spread {info['spread_pct']:.2f}% > 3%")
-    if issues:
-        return False, "; ".join(issues)
-    return True, "OK"
+    # Step 2: fetch changes + positional in parallel
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        change_futs = {t: pool.submit(fetch_crypto_change, t) for t in TICKERS}
+        pos_futs = {t: pool.submit(fetch_crypto_positional, t) for t in TICKERS}
+        changes = {t: f.result() for t, f in change_futs.items()}
+        positional = {t: f.result() for t, f in pos_futs.items()}
 
+    # Step 3: metals + F&G
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        metals_futs = {
+            "GC=F": pool.submit(fetch_metal, "GC=F", "Золото"),
+            "SI=F": pool.submit(fetch_metal, "SI=F", "Серебро"),
+        }
+        metals = {sym: f.result() for sym, f in metals_futs.items()}
+        fng_fut = pool.submit(fetch_fng)
+        fng = fng_fut.result()
 
-def main():
-    setup_logger()
-    load_env()
-    bot_token = os.environ["REDDINGTON_BOT_TOKEN"]
-    chat_id = os.environ["REDDINGTON_CHANNEL_ID"]
+    for sym, m in metals.items():
+        log("market_overview",
+            f"{m['name']} ${fmt_price(m['price'])} {fmt_chg(m['change_24h'])}")
 
-    ts = datetime.now(YEKT)
-    log("market_overview", f"start @ {ts.isoformat()}")
-
-    # 1. Fetch crypto prices in parallel
-    prices: dict = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(fetch_crypto_price, t): t for t in CRYPTO_TICKERS}
-        for f in as_completed(futs):
-            try:
-                info = f.result()
-                prices[info["ticker"]] = info
-                log("market_overview",
-                    f"{info['ticker']} ${info['price']:.2f} "
-                    f"spread={info['spread_pct']:.3f}% "
-                    f"n={info['n_sources']}")
-            except Exception as e:  # noqa: BLE001
-                t = futs[f]
-                log("market_overview", f"{t} FAIL: {e}")
-                raise
-
-    # 2. Fetch changes + OI + funding + L/S
-    changes: dict = {}
-    positional: dict = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {}
-        for t in CRYPTO_TICKERS:
-            futs[ex.submit(fetch_crypto_change, t)] = ("change", t)
-            futs[ex.submit(fetch_crypto_positional, t)] = ("pos", t)
-        for f in as_completed(futs):
-            kind, t = futs[f]
-            try:
-                if kind == "change":
-                    changes[t] = f.result()
-                else:
-                    positional[t] = f.result()
-            except Exception as e:  # noqa: BLE001
-                log("market_overview", f"{kind} {t} FAIL: {e}")
-
-    # 3. Fetch metals in parallel
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_g = ex.submit(fetch_metal, "Gold")
-        f_s = ex.submit(fetch_metal, "Silver")
-        prices["Gold"] = f_g.result()
-        prices["Silver"] = f_s.result()
-    log("market_overview", f"Gold ${prices['Gold']['price']:.2f} "
-        f"Silver ${prices['Silver']['price']:.2f}")
-
-    # 4. F&G
-    fng = fetch_fng()
-
-    # 5. Verify
-    ok, msg = verify_post_data(prices)
-    if not ok:
-        log("market_overview", f"VERIFY FAIL: {msg}")
+    # Step 4: verify
+    verify = verify_post_data(prices)
+    log("market_overview", f"VERIFY: {verify}")
+    if verify != "OK":
+        log("market_overview", f"ABORT: verification failed: {verify}")
         return
-    log("market_overview", f"VERIFY OK: {msg}")
 
-    # 6. Build chart for BTC
-    btc_ohlc = fetch_crypto_ohlc("BTC", days=7)
-    prices["_btc_price"] = prices["BTC"]["price"]  # for chart zones
-    chart_path = post_dir() / f"top5_btc_{ts.strftime('%Y%m%d_%H%M')}.png"
-    build_top5_chart({"BTC": btc_ohlc, "_btc_price": prices["BTC"]["price"]},
-                     chart_path)
-    log("market_overview", f"chart saved: {chart_path} ({chart_path.stat().st_size} B)")
+    # Step 5: chart for BTC (anchor ticker)
+    btc_ohlc = fetch_crypto_ohlc("BTC", days=7, limit=42)
+    btc_price = prices["BTC"]["price"]
+    sup, res = adaptive_zones(btc_price)
+    chart_dir = post_dir() / datetime.now().strftime("%Y-%m-%d")
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    chart_path = chart_dir / f"top5_btc_{datetime.now().strftime('%H%M')}.png"
+    build_top5_chart(btc_ohlc, "BTC", btc_price, sup, res, chart_path)
+    log("market_overview", f"chart saved: {chart_path}")
 
-    # 7. Build caption + body
-    caption = build_caption(prices, changes, ts)
-    body = build_body(prices, changes, positional, fng, ts)
+    # Step 6: caption + body
+    now_ye = datetime.now(timezone(timedelta(hours=5)))
+    date_str = now_ye.strftime("%d.%m.%Y %H:%M")
+    caption = build_caption(date_str)
+    body = build_body(prices, changes, positional, metals, fng, verify)
 
-    # 8. Post
+    # Step 7: post
     post_pair(str(chart_path), caption, body)
     log("market_overview", "posted OK")
 
