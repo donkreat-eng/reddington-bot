@@ -1,0 +1,28 @@
+"""13:30 YEKT market overview — BTC/ETH/BNB/SOL/XRP + Gold/Silver с позиционным слоем.
+
+Полностью автономный: 4 источника цены, верификация перед публикацией,
+фолбэки при недоступности, анти-спам фильтр на волатильности,
+форматирование через Telegram HTML.
+
+Запускается планировщиком ежедневно в 13:30 Asia/Yekaterinburg.
+Все сбои — текстом в лог, ни одного необработанного исключения наружу.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import statistics
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from typing import Any, Iterable
+
+import aiohttp
+
+# --- Конфигурация -----------------------------------------------------------
+
+YEKT = timezone(timedelta(hours=5))
