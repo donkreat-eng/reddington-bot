@@ -1,90 +1,59 @@
-
-    fx_line = ""
-    if usd_rub:
-        fx_line = f"\nUSD/RUB: <b>{usd_rub:.2f}₽</b>"
-    lines.append(fx_line)
-
-    pos = position_hint(prices)
-    if pos:
-        lines.append("")
-        lines.append(pos)
-
     lines.append("")
-    lines.append("<i>Источники: coingecko, coincap, kraken, binance.</i>")
-    lines.append("<i>Расхождение σ — разброс медианы между источниками.</i>")
+    for name in METAL_SYMBOLS:
+        row = prices[name]
+        arrow = "🟢" if row["change_pct"] >= 0 else "🔴"
+        sign = "+" if row["change_pct"] >= 0 else ""
+        lines.append(
+            f"{arrow} <b>{name}</b>  <code>${fmt_price(row['price'])}</code>  "
+            f"{sign}{row['change_pct']:.2f}%"
+        )
+    if fng:
+        lines.append("")
+        lines.append(f"😨 <b>F&G</b>: {fng['value']} — {fng['classification']}")
     return "\n".join(lines)
 
 
-# --- Telegram ---------------------------------------------------------------
+# --- Сборка позиционного слоя ---------------------------------------------
 
-class Telegram:
-    def __init__(self, http: Http) -> None:
-        self.http = http
-        self.token = TELEGRAM_TOKEN
-        self.chat = TELEGRAM_CHAT
-
-    async def send(self, text: str) -> None:
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        payload = {
-            "chat_id": self.chat,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        async with self.http.s.post(
-            url, json=payload, timeout=aiohttp.ClientTimeout(total=FETCH_PER_REQUEST_SEC)
-        ) as resp:
-            body = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"telegram {resp.status}: {body[:300]}")
-            log.info("telegram ok, %d bytes", len(body))
-
-
-# --- Главный пайплайн -------------------------------------------------------
-
-async def run_once(state_path: str) -> bool:
-    """Возвращает True, если сообщение было отправлено."""
-    deadline = time.monotonic() + FETCH_TOTAL_BUDGET_SEC
-    timeout = aiohttp.ClientTimeout(total=FETCH_PER_REQUEST_SEC)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        http = Http(session)
-        agg = PriceAggregator(http)
-        fx = FxRate(http)
-        dedupe = Dedupe(state_path)
-
-        per_source = await agg.fetch_all()
-        verified = PriceAggregator.verify(per_source)
-        if not verified:
-            log.error("no verified prices — abort run")
-            return False
-
-        usd_rub = await fx.fetch()
-
-        if not dedupe.should_publish(verified):
-            log.info("dedupe: skipped publish")
-            return False
-
-        msg = build_message(verified, usd_rub)
-        tg = Telegram(http)
-        await tg.send(msg)
-        dedupe.mark_published(verified)
-
-        # контроль времени — если упёрлись в бюджет, логируем
-        elapsed = time.monotonic() - deadline + FETCH_TOTAL_BUDGET_SEC
-        log.info("run finished in %.2fs (budget %.2fs)", elapsed, FETCH_TOTAL_BUDGET_SEC)
-        return True
+def build_position_layer(prices: dict[str, dict]) -> str:
+    """Один-два абзаца про контекст: BTC доминирование не считаем,
+    опираемся на расхождения источников, волатильность и поведение метала.
+    Без рекомендаций, без явных уровней — только описание режима."""
+    notes: list[str] = []
+    btc = prices.get("BTC", {})
+    if btc.get("agree", 0) >= 3:
+        notes.append("BTC согласовано по 3+ источникам — режим спокойный.")
+    elif btc.get("agree", 0) == 2:
+        notes.append("BTC: 2 из {} источников подтверждают медиану — возможен локальный перекос.".format(
+            len(PRICE_SOURCES)))
+    else:
+        notes.append("⚠️ BTC: источники расходятся, цена неустойчива.")
+    if btc.get("spread_pct", 0.0) > 1.0:
+        notes.append(f"Спред BTC между биржами {btc['spread_pct']:.2f}% — ликвидность фрагментирована.")
+    g = prices.get("Gold", {})
+    s = prices.get("Silver", {})
+    if g.get("price") and s.get("price"):
+        ratio = s["price"] / g["price"] if g["price"] else 0
+        notes.append(f"Gold/Silver ratio ≈ {ratio:.1f}.")
+    if not notes:
+        return ""
+    return "🧭 <b>Контекст</b>:\n" + "\n".join(f"  • {n}" for n in notes)
 
 
-def main() -> None:
-    state = os.getenv("STATE_PATH", "/tmp/market_overview_state.json")
-    try:
-        sent = asyncio.run(run_once(state))
-    except Exception:  # noqa: BLE001
-        log.exception("market_overview run failed")
-        # Намеренно выходим 0 — планировщик не должен спамить рестартами.
-        sys.exit(0)
-    log.info("sent=%s", sent)
+# --- Главный поток ----------------------------------------------------------
 
-
-if __name__ == "__main__":
-    main()
+def post_pair(caption: str, body: str) -> None:
+    """POST в Telegram. Простой HTML parse_mode."""
+    import urllib.parse
+    import urllib.request
+    text = f"<b>{caption}</b>\n\n{body}"
+    data = urllib.parse.urlencode({
+        "chat_id": TELEGRAM_CHAT,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        data=data,
+    )
