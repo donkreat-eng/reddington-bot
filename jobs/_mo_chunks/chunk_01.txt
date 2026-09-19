@@ -3,49 +3,28 @@ BNB": "binancecoin",
 
 PRICE_SOURCES = ["binance", "coingecko", "kraken", "coinbase"]
 THROTTLE = {"binance": 0.25, "coingecko": 2.0, "kraken": 0.5, "coinbase": 0.5}
-FETCH_TIMEOUT = 6
-FETCH_PER_REQUEST_SEC = 6.0
-USER_AGENT = "reddington-market-overview/1.0 (+https://reddington.example)"
+BINANCE_BASE = "https://api.binance.com"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+KRAKEN_BASE = "https://api.kraken.com/0/public"
+COINBASE_BASE = "https://api.coinbase.com/v2"
+BYBIT_BASE = "https://api.bybit.com/v5/market"
+KRAKEN_INTERVAL = {4 * 3600: 240}  # 4h interval in minutes for Kraken OHLC
 
-TELEGRAM_TOKEN = os.environ["TG_BOT_TOKEN"]
-TELEGRAM_CHAT = os.environ["TG_CHAT_ID"]
+# Cache for Bybit tickers (single batch call is much cheaper than 5 separate calls)
+_BYBIT_CACHE: dict = {"ts": 0.0, "data": {}}
+_BYBIT_CACHE_TTL = 30.0  # seconds
 
-
-def _http_json(url: str, params: dict | None = None, timeout: int = FETCH_TIMEOUT) -> Any:
-    """GET с ретраями; возвращает распарсенный JSON или поднимает."""
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    last: Exception | None = None
-    for attempt in range(3):
-        try:
-            r = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
-            if r.status_code == 429 or r.status_code >= 500:
-                raise RuntimeError(f"upstream {r.status_code}")
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(2 ** attempt)
-    raise RuntimeError(f"http failed after retries: {last}")
+OKX_BASE = "https://www.okx.com"
+OKX_SWAP_INST: dict[str, str] = {
+    "BTCUSDT": "BTC-USDT-SWAP",
+    "ETHUSDT": "ETH-USDT-SWAP",
+    "BNBUSDT": "BNB-USDT-SWAP",
+    "SOLUSDT": "SOL-USDT-SWAP",
+    "XRPUSDT": "XRP-USDT-SWAP",
+}
 
 
-def _throttle(source: str) -> float:
-    return THROTTLE.get(source, FETCH_PER_REQUEST_SEC)
-
-
-def _now_yekt() -> datetime:
-    return datetime.now(timezone.utc).astimezone(YEKT)
-
-
-def _coingecko_snapshot() -> dict[str, dict]:
-    ids = COINGECKO_IDS
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"vs_currencies": "usd", "include_24hr_change": "true", "include_24hr_vol": "true"}
-    full = {tk: {**p, "id": cg_id} for tk, cg_id in zip(ids, _http_json(url, params).values())} if False else None  # placeholder
-    data = _http_json(url, {"ids": ",".join(ids.values()), "vs_currencies": "usd",
-                            "include_24hr_change": "true", "include_24hr_vol": "true"})
-    out = {}
-    for tk, cg_id in ids.items():
-        d = data.get(cg_id, {})
-        out[tk] = {"price": d.get("usd"), "change": d.get("usd_24h_change"),
-                   "volume": d.get("usd_24h_vol")}
-    return out
+def _http_json(url: str, params: dict | None = None, timeout: int = 10):
+    r = requests.get(url, params=params or {}, timeout=timeout)
+    r.raise_for_status()
+    return r.jso
