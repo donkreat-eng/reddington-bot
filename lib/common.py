@@ -76,7 +76,8 @@ def load_env():
     return merged
 
 
-_LOGGERS: dict[str, logging.Logger] = {}
+def _save_credentials_log_only(name: str) -> bool:
+    pass
 
 
 def setup_logger(name="market_overview"):
@@ -104,6 +105,17 @@ def log(name, msg):
 
 
 def post_dir() -> Path:
-    """Return path to posts/ output directory."""
-    POST_DIR.mkdir(parents=True, exist_ok=True)
+    """Return POST_DIR as Path."""
     return POST_DIR
+
+
+def ye_now():
+    """Current time in Yekaterinburg timezone (UTC+5)."""
+    ye = timezone(timedelta(hours=5))
+    return datetime.now(ye)
+
+
+def ye_str(dt=None, fmt="%Y-%m-%d %H:%M:%S"):
+    if dt is None:
+        dt = ye_now()
+    return dt.strftime(fmt)
