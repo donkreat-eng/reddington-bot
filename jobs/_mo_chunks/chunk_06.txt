@@ -1,85 +1,57 @@
-
-        return True
-
-    def mark_published(self, prices: dict[str, VerifiedPrice]) -> None:
-        self._cache["last_publish"] = {
-            "ts": time.time(),
-            "prices": {sym: vp.usd for sym, vp in prices.items()},
+ / med_price) <= 0.02)
+        spread = max((v[0] for v in votes), default=0.0) - min((v[0] for v in votes), default=0.0)
+        spread_pct = (spread / med_price) * 100 if med_price else 0.0
+        prices[tk] = {
+            "price": med_price, "change_pct": change_pct,
+            "volume_24h": vol, "source": ref[3],
+            "spread_pct": spread_pct, "agree": agree,
         }
-        self._save()
+
+    for name in METAL_SYMBOLS:
+        prices[name] = metals.get(name) or {"price": 0.0, "change_pct": 0.0,
+                                            "source": "none"}
+
+    return prices
 
 
-# --- Позиционный слой --------------------------------------------------------
-
-def position_hint(prices: dict[str, VerifiedPrice]) -> str:
-    """Если есть все нужные активы, считаем ‘образцовое’ распределение в USD.
-
-    Возвращаем строку с суммой и долями, либо пустую строку.
-    """
-    total_usd = 0.0
-    parts: list[tuple[str, float, int]] = []
-    for sym, weight in POSITION_TEMPLATE:
-        vp = prices.get(sym)
-        if not vp:
+def verify_post_data(prices: dict[str, dict]) -> tuple[bool, str]:
+    """Перед отправкой — все основные тикеры имеют цену > 0 и согласованы."""
+    issues: list[str] = []
+    for tk in CRYPTO_TICKERS:
+        row = prices.get(tk, {})
+        px = row.get("price", 0.0)
+        if px <= 0:
+            issues.append(f"{tk}=0")
             continue
-        total_usd += vp.usd * weight
-        parts.append((sym, vp.usd, weight))
-    if not parts:
-        return ""
-    lines = ["<b>Позиционный слой (образец)</b>"]
-    for sym, usd, w in parts:
-        lines.append(f"  {sym}: ${usd:,.2f} ×{w}")
-    lines.append(f"<b>Σ ~ ${total_usd:,.2f}</b>")
-    return "\n".join(lines)
+        if row.get("agree", 0) < 2 and len(PRICE_SOURCES) >= 3:
+            issues.append(f"{tk} low agree={row.get('agree')}")
+        if row.get("spread_pct", 0.0) > 5.0:
+            issues.append(f"{tk} spread={row.get('spread_pct'):.1f}%")
+    for name in METAL_SYMBOLS:
+        row = prices.get(name, {})
+        if row.get("price", 0.0) <= 0:
+            issues.append(f"{name}=0")
+    if issues:
+        return False, "; ".join(issues)
+    return True, "ok"
 
 
-# --- Форматирование ----------------------------------------------------------
+# --- Постобработка и публикация --------------------------------------------
 
-def fmt_price(usd: float, asset: str) -> str:
-    if asset in ("BTC", "ETH"):
-        return f"${usd:,.0f}"
-    if asset in ("BNB", "SOL", "XRP"):
-        return f"${usd:,.2f}"
-    # metals
-    if asset == "Gold":
-        return f"${usd:,. & nbsp;,.2f}".replace(", & nbsp;", " ")  # тонкая шпация в тысячах
-    if asset == "Silver":
-        return f"${usd:.2f}"
-    return f"${usd:,.2f}"
-
-
-def build_message(prices: dict[str, VerifiedPrice], usd_rub: float | None) -> str:
-    now_local = datetime.now(YEKT).strftime("%d.%m.%Y %H:%M")
-    coins = [sym for sym, _ in COINS]
-    metals = [sym for sym, _ in METALS]
-
-    lines: list[str] = [f"<b>Обзор рынка {now_local} YEKT</b>", ""]
-
-    lines.append("<b>Крипто</b>")
-    for sym in coins:
-        vp = prices.get(sym)
-        if not vp:
-            lines.append(f"  {sym}: <i>n/a</i>")
-            continue
-        usd_str = fmt_price(vp.usd, sym)
-        rub_str = ""
-        if usd_rub:
-            rub_str = f" · {vp.usd * usd_rub:,.0f}₽"
-        lines.append(
-            f"  <b>{sym}</b>  {usd_str}{rub_str}  "
-            f"<i>σ {vp.spread_pct:.2f}% · {len(vp.sources)} ист.</i>"
-        )
-
+def format_body(prices: dict[str, dict], fng: dict | None) -> str:
+    """Текст поста: котировки + изменения + расхождения источников."""
+    lines: list[str] = []
+    now = datetime.now(YEKT).strftime("%d.%m %H:%M")
+    lines.append(f"🪙 <b>{now} YEKT — обзор рынка</b>")
     lines.append("")
-    lines.append("<b>Металлы</b>")
-    for sym in metals:
-        vp = prices.get(sym)
-        if not vp:
-            lines.append(f"  {sym}: <i>n/a</i>")
-            continue
-        usd_str = fmt_price(vp.usd, sym)
-        rub_str = f" · {vp.usd * usd_rub:,.0f}₽" if usd_rub else ""
+    for tk in CRYPTO_TICKERS:
+        row = prices[tk]
+        arrow = "🟢" if row["change_pct"] >= 0 else "🔴"
+        sign = "+" if row["change_pct"] >= 0 else ""
+        agree_note = "" if row.get("agree", 0) >= 2 \
+            else f" ⚠️ источники расходятся ({row.get('agree',0)}/{len(PRICE_SOURCES)})"
         lines.append(
-            f"  <b>{sym}</b>  {usd_str}{rub_str}  "
-            f"<i>σ {vp.spread_pct:.2f}% · {len(vp.sources)} ист.</i>"
+            f"{arrow} <b>{tk}</b>  <code>${fmt_price(row['price'])}</code>  "
+            f"{sign}{row['change_pct']:.2f}%  vol ${fmt_volume(row['volume_24h'])}"
+            f"{agree_note}"
         )
