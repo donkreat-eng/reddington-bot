@@ -1,43 +1,24 @@
+BNB": "binancecoin",
+                 "SOL": "solana", "XRP": "ripple"}
+
+PRICE_SOURCES = ["binance", "coingecko", "kraken", "coinbase"]
+THROTTLE = {"binance": 0.25, "coingecko": 2.0, "kraken": 0.5, "coinbase": 0.5}
+FETCH_TIMEOUT = 6
+FETCH_PER_REQUEST_SEC = 6.0
+USER_AGENT = "reddington-market-overview/1.0 (+https://reddington.example)"
 
 TELEGRAM_TOKEN = os.environ["TG_BOT_TOKEN"]
 TELEGRAM_CHAT = os.environ["TG_CHAT_ID"]
 
-COINS = [
-    ("BTC", "bitcoin"),
-    ("ETH", "ethereum"),
-    ("BNB", "binancecoin"),
-    ("SOL", "solana"),
-    ("XRP", "ripple"),
-]
-METALS = [("Gold", "gold"), ("Silver", "silver")]
 
-PRICE_SOURCES: list[tuple[str, str]] = [
-    ("coingecko", "https://api.coingecko.com/api/v3/simple/price"),
-    ("coincap",   "https://rest.coincap.io/v3/assets"),
-    ("kraken",    "https://api.kraken.com/0/public/Ticker"),
-    ("binance",   "https://api.binance.com/api/v3/ticker/24hr"),
-]
-
-USD_RUB_SOURCE = "https://api.exchangerate.host/latest?base=USD&symbols=RUB"
-
-# Ценовые пороги — после них сообщение сразу публикуется, без анти-спам паузы
-ABS_PRICE_JUMP_USD = 1500.0       # BTC и подобные крупные активы
-ABS_PRICE_JUMP_USD_SMALL = 0.50   # XRP, мелкие альты
-PCT_PRICE_JUMP = 3.0              # 3% за последние сутки
-
-# Анти-спам: если дельта меньше порогов, публикуем не чаще раза в N часов
-QUIET_HOURS = 4
-
-# Позиционный слой — портфель «образцовый», для подсказки читателю
-POSITION_TEMPLATE = [
-    ("BTC",  40),
-    ("ETH",  25),
-    ("BNB",  10),
-    ("SOL",  10),
-    ("XRP",   5),
-    ("Gold",  7),
-    ("Silver", 3),
-]
-
-FETCH_TOTAL_BUDGET_SEC = 18.0  # общий бюджет на все HTTP-запросы
-FETCH_PER_REQUEST_SEC = 6.0
+def _http_json(url: str, params: dict | None = None, timeout: int = FETCH_TIMEOUT) -> Any:
+    """GET с ретраями; возвращает распарсенный JSON или поднимает."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
+            if r.status_code == 429 or r.status_code >= 500:
+                raise RuntimeError(f"upstream {r.status_code}")
+            r.raise_for_status()
+            return r.jso
