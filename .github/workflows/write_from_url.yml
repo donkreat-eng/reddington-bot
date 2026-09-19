@@ -1,50 +1,27 @@
 name: write_from_url
 on:
-  workflow_dispatch:
-    inputs:
-      path:
-        description: "path in repo"
-        required: true
-        type: string
-      source_url:
-        description: "URL to fetch content from"
-        required: true
-        type: string
-      message:
-        description: "commit message"
-        required: true
-        type: string
+  push:
+    paths: ['jobs/_mo_chunks/**']
 permissions:
   contents: write
 jobs:
-  write:
+  push-concat:
     runs-on: ubuntu-latest
     steps:
-      - name: write file via API
-        uses: actions/github-script@v7
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
         with:
           script: |
-            const url = process.env.INPUT_SOURCE_URL;
-            const path = process.env.INPUT_PATH;
-            const message = process.env.INPUT_MESSAGE;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const resp = await fetch(url);
-            if (!resp.ok) throw new Error(`fetch ${url}: ${resp.status}`);
-            const buf = Buffer.from(await resp.arrayBuffer());
-            const content = buf.toString('base64');
-            core.info(`fetched size=${buf.length}`);
-            let sha;
-            try {
-              const r = await github.rest.repos.getContent({ owner, repo, path });
-              sha = r.data.sha;
-              core.info(`existing sha=${sha}`);
-            } catch (e) {
-              if (e.status !== 404) throw e;
-              core.info('new file');
-            }
-            const params = { owner, repo, path, message, content, branch: 'main' };
-            if (sha) params.sha = sha;
-            const res = await github.rest.repos.createOrUpdateFileContents(params);
-            core.info(`commit=${res.data.commit.sha}`);
-            core.info(`size=${res.data.content.size}`);
+            const fs=require('fs');const p=require('path');
+            const d='jobs/_mo_chunks';
+            if(!fs.existsSync(d)){core.info('no chunks dir');return;}
+            const files=fs.readdirSync(d).filter(f=>f.startsWith('chunk_')&&f.endsWith('.txt')).sort();
+            if(!files.length){core.info('no chunks');return;}
+            if(!fs.existsSync(d+'/DONE')){core.info('not done yet');return;}
+            let s='';for(const f of files)s+=fs.readFileSync(p.join(d,f),'utf-8');
+            const owner=context.repo.owner,repo=context.repo.repo,path='jobs/market_overview.py';
+            let sha;try{const r=await github.rest.repos.getContent({owner,repo,path});sha=r.data.sha}catch(e){if(e.status!==404)throw e}
+            const params={owner,repo,path,message:'Concat chunks to jobs/market_overview.py',content:Buffer.from(s).toString('base64'),branch:'main'};
+            if(sha)params.sha=sha;
+            const res=await github.rest.repos.createOrUpdateFileContents(params);
+            core.info(`commit=${res.data.commit.sha} size=${res.data.content.size}`);
