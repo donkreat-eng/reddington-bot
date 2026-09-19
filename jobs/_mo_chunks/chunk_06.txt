@@ -1,0 +1,85 @@
+
+        return True
+
+    def mark_published(self, prices: dict[str, VerifiedPrice]) -> None:
+        self._cache["last_publish"] = {
+            "ts": time.time(),
+            "prices": {sym: vp.usd for sym, vp in prices.items()},
+        }
+        self._save()
+
+
+# --- Позиционный слой --------------------------------------------------------
+
+def position_hint(prices: dict[str, VerifiedPrice]) -> str:
+    """Если есть все нужные активы, считаем ‘образцовое’ распределение в USD.
+
+    Возвращаем строку с суммой и долями, либо пустую строку.
+    """
+    total_usd = 0.0
+    parts: list[tuple[str, float, int]] = []
+    for sym, weight in POSITION_TEMPLATE:
+        vp = prices.get(sym)
+        if not vp:
+            continue
+        total_usd += vp.usd * weight
+        parts.append((sym, vp.usd, weight))
+    if not parts:
+        return ""
+    lines = ["<b>Позиционный слой (образец)</b>"]
+    for sym, usd, w in parts:
+        lines.append(f"  {sym}: ${usd:,.2f} ×{w}")
+    lines.append(f"<b>Σ ~ ${total_usd:,.2f}</b>")
+    return "\n".join(lines)
+
+
+# --- Форматирование ----------------------------------------------------------
+
+def fmt_price(usd: float, asset: str) -> str:
+    if asset in ("BTC", "ETH"):
+        return f"${usd:,.0f}"
+    if asset in ("BNB", "SOL", "XRP"):
+        return f"${usd:,.2f}"
+    # metals
+    if asset == "Gold":
+        return f"${usd:,. & nbsp;,.2f}".replace(", & nbsp;", " ")  # тонкая шпация в тысячах
+    if asset == "Silver":
+        return f"${usd:.2f}"
+    return f"${usd:,.2f}"
+
+
+def build_message(prices: dict[str, VerifiedPrice], usd_rub: float | None) -> str:
+    now_local = datetime.now(YEKT).strftime("%d.%m.%Y %H:%M")
+    coins = [sym for sym, _ in COINS]
+    metals = [sym for sym, _ in METALS]
+
+    lines: list[str] = [f"<b>Обзор рынка {now_local} YEKT</b>", ""]
+
+    lines.append("<b>Крипто</b>")
+    for sym in coins:
+        vp = prices.get(sym)
+        if not vp:
+            lines.append(f"  {sym}: <i>n/a</i>")
+            continue
+        usd_str = fmt_price(vp.usd, sym)
+        rub_str = ""
+        if usd_rub:
+            rub_str = f" · {vp.usd * usd_rub:,.0f}₽"
+        lines.append(
+            f"  <b>{sym}</b>  {usd_str}{rub_str}  "
+            f"<i>σ {vp.spread_pct:.2f}% · {len(vp.sources)} ист.</i>"
+        )
+
+    lines.append("")
+    lines.append("<b>Металлы</b>")
+    for sym in metals:
+        vp = prices.get(sym)
+        if not vp:
+            lines.append(f"  {sym}: <i>n/a</i>")
+            continue
+        usd_str = fmt_price(vp.usd, sym)
+        rub_str = f" · {vp.usd * usd_rub:,.0f}₽" if usd_rub else ""
+        lines.append(
+            f"  <b>{sym}</b>  {usd_str}{rub_str}  "
+            f"<i>σ {vp.spread_pct:.2f}% · {len(vp.sources)} ист.</i>"
+        )
