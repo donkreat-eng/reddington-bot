@@ -497,7 +497,7 @@ def main():
     body = build_body(prices, changes, positional, fng, ts)
 
     # 8. Post
-    post_pair(bot_token, chat_id, str(chart_path), caption, body)
+    post_pair(str(chart_path), caption, body)
     log("market_overview", "posted OK")
 
 
