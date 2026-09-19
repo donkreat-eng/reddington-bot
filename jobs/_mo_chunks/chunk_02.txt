@@ -1,0 +1,65 @@
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)-7s %(name)s :: %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("market_overview")
+
+
+# --- Модели ------------------------------------------------------------------
+
+@dataclass(slots=True)
+class PricePoint:
+    asset: str          # "BTC"
+    source: str         # "coingecko"
+    usd: float
+    ts: float           # unix seconds, момент фикса цены источником
+
+
+@dataclass(slots=True)
+class VerifiedPrice:
+    asset: str
+    usd: float
+    spread_pct: float
+    sources: list[str] = field(default_factory=list)
+    asof: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# --- HTTP --------------------------------------------------------------------
+
+class Http:
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self.s = session
+
+    async def get_json(self, url: str, params: dict | None = None) -> tuple[Any, float]:
+        """Возвращает (parsed_json, unix_ts источника). Бросает RuntimeError при ошибке."""
+        t0 = time.monotonic()
+        try:
+            async with self.s.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=FETCH_PER_REQUEST_SEC),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise RuntimeError(f"GET {url} failed: {exc!r}") from exc
+        return data, time.time()
+
+
+# --- Источники ---------------------------------------------------------------
+
+class PriceAggregator:
+    def __init__(self, http: Http) -> None:
+        self.http = http
+
+    async def fetch_coingecko(self) -> dict[str, PricePoint]:
+        ids = ",".join(slug for _, slug in COINS + METALS)
+        data, ts = await self.http.get_json(
+            PRICE_SOURCES[0][1],
+            params={"ids": ids, "vs_currencies": "usd"},
+        )
+        out: dict[str, PricePoint] = {}
+        for symbol, slug in COINS + METALS:
