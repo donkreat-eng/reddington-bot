@@ -1,0 +1,75 @@
+            p = data.get("lastPrice")
+            if not isinstance(p, (int, float, str)):
+                continue
+            try:
+                price = float(p)
+            except (TypeError, ValueError):
+                continue
+            base = sym.replace("USDT", "")
+            asset = {"BTC": "BTC", "ETH": "ETH", "BNB": "BNB", "SOL": "SOL", "XRP": "XRP"}.get(base)
+            if asset:
+                out[asset] = PricePoint(asset=asset, source="binance", usd=price, ts=ts)
+                ts_max = max(ts_max, ts)
+        # нормализуем ts на максимум по всем тикерам — это момент «свежести» данных
+        for pp in out.values():
+            if pp.ts < ts_max:
+                pp.ts = ts_max
+        return out
+
+    async def fetch_all(self) -> list[dict[str, PricePoint]]:
+        results = await asyncio.gather(
+            self.fetch_coingecko(),
+            self.fetch_coincap(),
+            self.fetch_kraken(),
+            self.fetch_binance(),
+            return_exceptions=True,
+        )
+        clean: list[dict[str, PricePoint]] = []
+        for i, r in enumerate(results):
+            name = PRICE_SOURCES[i][0]
+            if isinstance(r, BaseException):
+                log.warning("source %s failed: %r", name, r)
+                continue
+            clean.append(r)
+        return clean
+
+    @staticmethod
+    def verify(per_source: list[dict[str, PricePoint]], max_spread_pct: float = 1.5) -> dict[str, VerifiedPrice]:
+        """Медиана + контроль рассеяния. Возвращает только те активы, где разброс ≤ порога."""
+        buckets: dict[str, list[PricePoint]] = {}
+        for src in per_source:
+            for sym, pp in src.items():
+                buckets.setdefault(sym, []).append(pp)
+
+        verified: dict[str, VerifiedPrice] = {}
+        for sym, points in buckets.items():
+            if not points:
+                continue
+            prices = [p.usd for p in points]
+            med = statistics.median(prices)
+            spread = (max(prices) - min(prices)) / med * 100.0 if med else 0.0
+            if spread > max_spread_pct:
+                log.warning(
+                    "spread too wide for %s: %.2f%% (n=%d, src=%s)",
+                    sym, spread, len(points), [p.source for p in points],
+                )
+                continue
+            ts = max(p.ts for p in points)
+            verified[sym] = VerifiedPrice(
+                asset=sym,
+                usd=round(med, 6 if med < 1 else 2),
+                spread_pct=round(spread, 3),
+                sources=sorted(p.source for p in points),
+                asof=datetime.fromtimestamp(ts, tz=timezone.utc),
+            )
+        return verified
+
+
+# --- USD/RUB ----------------------------------------------------------------
+
+class FxRate:
+    def __init__(self, http: Http) -> None:
+        self.http = http
+
+    async def fetch(self) -> float | None:
+        try:
