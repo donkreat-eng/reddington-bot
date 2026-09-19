@@ -1,58 +1,47 @@
-            price = (data.get(slug) or {}).get("usd")
-            if isinstance(price, (int, float)):
-                out[symbol] = PricePoint(asset=symbol, source="coingecko", usd=float(price), ts=ts)
-        return out
 
-    async def fetch_coincap(self) -> dict[str, PricePoint]:
-        ids = ",".join(slug for _, slug in COINS)
-        url = f"{PRICE_SOURCES[1][1]}?ids={ids}&filterPriceUsd=true&limit=20"
-        data, ts = await self.http.get_json(url)
-        out: dict[str, PricePoint] = {}
-        for asset in data.get("data", []) or []:
-            slug = asset.get("id")
-            price = asset.get("priceUsd")
-            sym = next((s for s, sl in COINS if sl == slug), None)
-            if sym and isinstance(price, (int, float, str)):
-                try:
-                    p = float(price)
-                except (TypeError, ValueError):
-                    continue
-                out[sym] = PricePoint(asset=sym, source="coincap", usd=p, ts=ts)
-        return out
+            if d:
+                out[tk] = {
+                    "price": float(d.get(vs, 0.0)),
+                    "change_pct": float(d.get(f"{vs}_24h_change", 0.0)),
+                    "volume_24h": float(d.get(f"{vs}_24h_vol", 0.0)),
+                    "source": "coingecko",
+                }
+    except Exception as e:  # noqa: BLE001
+        log("market_overview", f"coingecko: {e}")
+    _throttle("coingecko")
+    return out
 
-    async def fetch_kraken(self) -> dict[str, PricePoint]:
-        pairs = "XBTUSD,ETHUSD,SOLUSD,XRPUSD"
-        url = f"{PRICE_SOURCES[2][1]}?pair={pairs}"
-        data, ts = await self.http.get_json(url)
-        out: dict[str, PricePoint] = {}
-        result = data.get("result") or {}
-        # пары Kraken не всегда совпадают 1:1, делаем аккуратный маппинг
-        kraken_to_symbol = {
-            "XXBTZUSD": "BTC",
-            "XETHZUSD": "ETH",
-            "SOLUSD":   "SOL",
-            "XXRPZUSD": "XRP",
-        }
-        for kpair, payload in result.items():
-            sym = kraken_to_symbol.get(kpair)
-            if not sym:
+
+def fetch_kraken(symbols: dict[str, str]) -> dict[str, dict]:
+    """Kraken public Ticker. Переводит тикер Binance -> пара Kraken."""
+    KRAKEN_PAIR = {"BTC": "XBT", "ETH": "ETH", "BNB": "BNB",
+                   "SOL": "SOL", "XRP": "XRP"}
+    out: dict[str, dict] = {}
+    base = "https://api.kraken.com/0/public/Ticker"
+    for tk, sym in symbols.items():
+        kraken_sym = f"{KRAKEN_PAIR.get(tk, tk)}USD"
+        try:
+            data = _http_json(base, params={"pair": kraken_sym})
+            res = data.get("result", {})
+            if not res:
                 continue
-            last = (payload.get("c") or [None])[0]
-            if isinstance(last, str):
-                try:
-                    out[sym] = PricePoint(asset=sym, source="kraken", usd=float(last), ts=ts)
-                except ValueError:
-                    pass
-        return out
+            payload = next(iter(res.values()))
+            close = float(payload["c"][0])
+            open_ = float(payload["o"])
+            change_pct = ((close - open_) / open_) * 100 if open_ else 0.0
+            vol = float(payload["v"][1])  # today volume
+            out[tk] = {"price": close, "change_pct": change_pct,
+                       "volume_24h": vol * close, "source": "kraken"}
+        except Exception as e:  # noqa: BLE001
+            log("market_overview", f"kraken {tk}: {e}")
+        _throttle("kraken")
+    return out
 
-    async def fetch_binance(self) -> dict[str, PricePoint]:
-        symbols = "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT"
-        out: dict[str, PricePoint] = {}
-        ts_max = 0.0
-        for sym in symbols.split(","):
-            url = f"{PRICE_SOURCES[3][1]}?symbol={sym}"
-            try:
-                data, ts = await self.http.get_json(url)
-            except RuntimeError as exc:
-                log.warning("binance: %s", exc)
-                continue
+
+def fetch_coinbase(symbols: dict[str, str]) -> dict[str, dict]:
+    """Coinbase public /products/<id>/ticker. USD."""
+    out: dict[str, dict] = {}
+    for tk, sym in symbols.items():
+        url = f"https://api.exchange.coinbase.com/products/{sym.replace('USDT', '-USD')}/ticker"
+        try:
+            data = _http_json(url)
