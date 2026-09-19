@@ -80,3 +80,4 @@ def build_body(prices: dict, changes: dict, positional: dict,
         arrow = "▲" if ch >= 0 else "▼"
         lines.append(
             f"{t:<8} ${p:>10,.2f} {arrow}{abs(ch):>5.2f}% "
+            
