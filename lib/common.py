@@ -76,31 +76,33 @@ def load_env():
     return merged
 
 
-def _save_credentials_log_only(name: str) -> bool:
-    pass
+_LOGGERS: dict[str, logging.Logger] = {}
 
 
 def setup_logger(name="market_overview"):
     """Logger that writes to file and stdout."""
     if name in _LOGGERS:
         return _LOGGERS[name]
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger(f"reddington.{name}")
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        _LOGGERS[name] = logger
+        return logger
     logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        fh = logging.FileHandler(LOG_DIR / f"{name}.log", encoding="utf-8")
-        sh = logging.StreamHandler()
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
-                                datefmt="%Y-%m-%d %H:%M:%S")
-        fh.setFormatter(fmt)
-        sh.setFormatter(fmt)
-        logger.addHandler(fh)
-        logger.addHandler(sh)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    log_file = LOG_DIR / f"{name}.log"
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(sh)
     _LOGGERS[name] = logger
     return logger
 
 
-def log(name, msg):
+def log(name: str, msg: str) -> None:
+    """Quick log helper — uses cached logger by name."""
     setup_logger(name).info(msg)
 
 
