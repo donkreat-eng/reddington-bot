@@ -1,65 +1,44 @@
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)-7s %(name)s :: %(message)s",
-    datefmt="%H:%M:%S",
-    stream=sys.stdout,
-)
-log = logging.getLogger("market_overview")
+n()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"http failed after retries: {last}")
 
 
-# --- Модели ------------------------------------------------------------------
-
-@dataclass(slots=True)
-class PricePoint:
-    asset: str          # "BTC"
-    source: str         # "coingecko"
-    usd: float
-    ts: float           # unix seconds, момент фикса цены источником
+def _throttle(source: str) -> None:
+    time.sleep(THROTTLE.get(source, 1.0))
 
 
-@dataclass(slots=True)
-class VerifiedPrice:
-    asset: str
-    usd: float
-    spread_pct: float
-    sources: list[str] = field(default_factory=list)
-    asof: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+# --- Источники цен ----------------------------------------------------------
 
-
-# --- HTTP --------------------------------------------------------------------
-
-class Http:
-    def __init__(self, session: aiohttp.ClientSession) -> None:
-        self.s = session
-
-    async def get_json(self, url: str, params: dict | None = None) -> tuple[Any, float]:
-        """Возвращает (parsed_json, unix_ts источника). Бросает RuntimeError при ошибке."""
-        t0 = time.monotonic()
+def fetch_binance(symbols: dict[str, str]) -> dict[str, dict]:
+    """/ticker/24hr для пар из BINANCE_SYMBOL. USDT-котировки."""
+    out: dict[str, dict] = {}
+    for tk, sym in symbols.items():
+        url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={sym}"
         try:
-            async with self.s.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=FETCH_PER_REQUEST_SEC),
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise RuntimeError(f"GET {url} failed: {exc!r}") from exc
-        return data, time.time()
+            data = _http_json(url)
+            out[tk] = {
+                "price": float(data["lastPrice"]),
+                "change_pct": float(data["priceChangePercent"]),
+                "volume_24h": float(data["quoteVolume"]),
+                "source": "binance",
+            }
+        except Exception as e:  # noqa: BLE001
+            log("market_overview", f"binance {tk}: {e}")
+        _throttle("binance")
+    return out
 
 
-# --- Источники ---------------------------------------------------------------
-
-class PriceAggregator:
-    def __init__(self, http: Http) -> None:
-        self.http = http
-
-    async def fetch_coingecko(self) -> dict[str, PricePoint]:
-        ids = ",".join(slug for _, slug in COINS + METALS)
-        data, ts = await self.http.get_json(
-            PRICE_SOURCES[0][1],
-            params={"ids": ids, "vs_currencies": "usd"},
-        )
-        out: dict[str, PricePoint] = {}
-        for symbol, slug in COINS + METALS:
+def fetch_coingecko(ids: dict[str, str]) -> dict[str, dict]:
+    """/simple/price для COINGECKO_IDS."""
+    out: dict[str, dict] = {}
+    ids_csv = ",".join(ids.values())
+    vs = "usd"
+    url = f"https://api.coingecko.com/api/v3/simple/price"
+    try:
+        data = _http_json(url, params={"ids": ids_csv, "vs_currencies": vs,
+                                       "include_24hr_change": "true",
+                                       "include_24hr_vol": "true"})
+        for tk, cg_id in ids.items():
+            d = data.get(cg_id, {})
