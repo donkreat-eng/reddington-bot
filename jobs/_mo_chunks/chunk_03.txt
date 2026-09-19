@@ -1,0 +1,58 @@
+            price = (data.get(slug) or {}).get("usd")
+            if isinstance(price, (int, float)):
+                out[symbol] = PricePoint(asset=symbol, source="coingecko", usd=float(price), ts=ts)
+        return out
+
+    async def fetch_coincap(self) -> dict[str, PricePoint]:
+        ids = ",".join(slug for _, slug in COINS)
+        url = f"{PRICE_SOURCES[1][1]}?ids={ids}&filterPriceUsd=true&limit=20"
+        data, ts = await self.http.get_json(url)
+        out: dict[str, PricePoint] = {}
+        for asset in data.get("data", []) or []:
+            slug = asset.get("id")
+            price = asset.get("priceUsd")
+            sym = next((s for s, sl in COINS if sl == slug), None)
+            if sym and isinstance(price, (int, float, str)):
+                try:
+                    p = float(price)
+                except (TypeError, ValueError):
+                    continue
+                out[sym] = PricePoint(asset=sym, source="coincap", usd=p, ts=ts)
+        return out
+
+    async def fetch_kraken(self) -> dict[str, PricePoint]:
+        pairs = "XBTUSD,ETHUSD,SOLUSD,XRPUSD"
+        url = f"{PRICE_SOURCES[2][1]}?pair={pairs}"
+        data, ts = await self.http.get_json(url)
+        out: dict[str, PricePoint] = {}
+        result = data.get("result") or {}
+        # пары Kraken не всегда совпадают 1:1, делаем аккуратный маппинг
+        kraken_to_symbol = {
+            "XXBTZUSD": "BTC",
+            "XETHZUSD": "ETH",
+            "SOLUSD":   "SOL",
+            "XXRPZUSD": "XRP",
+        }
+        for kpair, payload in result.items():
+            sym = kraken_to_symbol.get(kpair)
+            if not sym:
+                continue
+            last = (payload.get("c") or [None])[0]
+            if isinstance(last, str):
+                try:
+                    out[sym] = PricePoint(asset=sym, source="kraken", usd=float(last), ts=ts)
+                except ValueError:
+                    pass
+        return out
+
+    async def fetch_binance(self) -> dict[str, PricePoint]:
+        symbols = "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT"
+        out: dict[str, PricePoint] = {}
+        ts_max = 0.0
+        for sym in symbols.split(","):
+            url = f"{PRICE_SOURCES[3][1]}?symbol={sym}"
+            try:
+                data, ts = await self.http.get_json(url)
+            except RuntimeError as exc:
+                log.warning("binance: %s", exc)
+                continue
