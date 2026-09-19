@@ -21,4 +21,31 @@ def _http_json(url: str, params: dict | None = None, timeout: int = FETCH_TIMEOU
             if r.status_code == 429 or r.status_code >= 500:
                 raise RuntimeError(f"upstream {r.status_code}")
             r.raise_for_status()
-            return r.jso
+            return r.json()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"http failed after retries: {last}")
+
+
+def _throttle(source: str) -> float:
+    return THROTTLE.get(source, FETCH_PER_REQUEST_SEC)
+
+
+def _now_yekt() -> datetime:
+    return datetime.now(timezone.utc).astimezone(YEKT)
+
+
+def _coingecko_snapshot() -> dict[str, dict]:
+    ids = COINGECKO_IDS
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"vs_currencies": "usd", "include_24hr_change": "true", "include_24hr_vol": "true"}
+    full = {tk: {**p, "id": cg_id} for tk, cg_id in zip(ids, _http_json(url, params).values())} if False else None  # placeholder
+    data = _http_json(url, {"ids": ",".join(ids.values()), "vs_currencies": "usd",
+                            "include_24hr_change": "true", "include_24hr_vol": "true"})
+    out = {}
+    for tk, cg_id in ids.items():
+        d = data.get(cg_id, {})
+        out[tk] = {"price": d.get("usd"), "change": d.get("usd_24h_change"),
+                   "volume": d.get("usd_24h_vol")}
+    return out
