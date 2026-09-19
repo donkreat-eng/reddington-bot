@@ -453,7 +453,6 @@ def _gold_api_metal(symbol: str) -> dict | None:
     """gold-api.com fallback (no auth, USD). symbol in {XAU, XAG}."""
     try:
         d = _http_json(f"https://api.gold-api.com/price/{symbol}", timeout=10)
-        # Endpoint only gives spot — change_pct set to 0; better than nothing
         return {"price": float(d["price"]), "change_pct": 0.0}
     except Exception:
         return None
@@ -497,12 +496,10 @@ def fetch_fng() -> int:
 
 def verify_post_data(prices: dict, changes: dict) -> str:
     """Returns 'OK' or 'FAIL: reason'."""
-    # Spot price median spread < 0.5%
     for t in CRYPTO_TICKERS:
         sp = prices.get(t, {}).get("spread", 99)
         if sp > 1.5:
             return f"FAIL: {t} spread {sp:.2f}% > 1.5%"
-    # Change within reasonable bounds
     for t in CRYPTO_TICKERS:
         ch = changes.get(t, {}).get("change_24h", 0)
         if abs(ch) > 30:
@@ -572,7 +569,6 @@ def build_body(prices: dict, changes: dict, positional: dict, fng: int, ts: date
         "",
     ]
 
-    # Table columns — show only what data exists for at least one ticker
     has_oi = any((positional.get(t) or {}).get("oi_usdt") is not None for t in CRYPTO_TICKERS)
     has_funding = any((positional.get(t) or {}).get("funding") is not None for t in CRYPTO_TICKERS)
     has_ls = any((positional.get(t) or {}).get("long_short") is not None for t in CRYPTO_TICKERS)
@@ -588,11 +584,9 @@ def build_body(prices: dict, changes: dict, positional: dict, fng: int, ts: date
     def _line(cells):
         return " ".join(f"{txt:<{w}}" if align == 'l' else f"{txt:>{w}}" for txt, w, align in cells)
 
-    # Header + separator
     parts.append(_line([(h, w, a) for h, w, a in cols]))
     parts.append(_line([("─" * w, w, 'l') for _, w, _ in cols]))
 
-    # Rows
     for t in CRYPTO_TICKERS:
         p = prices[t]["price"]
         ch = changes[t]["change_24h"]
@@ -611,7 +605,6 @@ def build_body(prices: dict, changes: dict, positional: dict, fng: int, ts: date
             row_cells.append((fmt_ls(pos.get('long_short')), 11, 'r'))
         parts.append(_line(row_cells))
 
-    # Gold/Silver
     for m in ["Gold", "Silver"]:
         d = prices[m]
         ch = changes[m].get("change_24h", 0)
@@ -624,12 +617,10 @@ def build_body(prices: dict, changes: dict, positional: dict, fng: int, ts: date
 
     parts.append("")
 
-    # F&G
     fng_emoji = "🟢" if fng >= 60 else "🔴" if fng <= 40 else "🟡"
     parts.append(f"🌡 *Fear &amp; Greed* {fng_emoji} {fng}/100")
     parts.append("")
 
-    # BTC zones from chart
     btc_pos = positional.get("BTC", {})
     btc_p = prices["BTC"]["price"]
     parts.append("🔍 *Зоны BTC*")
@@ -639,7 +630,6 @@ def build_body(prices: dict, changes: dict, positional: dict, fng: int, ts: date
     parts.append(f"Сопротивление {fmt_price(res)}")
     parts.append("")
 
-    # Cluster watch (BTC funding + L/S if available)
     funding = btc_pos.get("funding")
     ls = btc_pos.get("long_short")
     if funding is not None or ls is not None:
@@ -650,7 +640,6 @@ def build_body(prices: dict, changes: dict, positional: dict, fng: int, ts: date
             parts.append(f"L/S: {fmt_ls(ls)}")
         parts.append("")
 
-    # Watchlist hint
     parts.append("🧭 *Что смотреть*")
     parts.append("• BTC funding &gt; +0.05% — overheated longs")
     parts.append("• BTC L/S &gt; 1.5 — перевес лонгов")
@@ -687,7 +676,6 @@ def main():
     ts = ye_now()
     log("market_overview", f"start @ {ts.isoformat()}")
 
-    # 1. Fetch prices, changes, positional in parallel
     with ThreadPoolExecutor(max_workers=12) as ex:
         futs = {}
         for t in CRYPTO_TICKERS:
@@ -712,35 +700,30 @@ def main():
             elif kind == "pos":
                 positional[key] = v
             elif kind == "metal":
-                prices[key] = v  # store metals under prices too
+                prices[key] = v
 
-    # 2. Add metals change_24h to changes dict
     for m in ["Gold", "Silver"]:
         if m in prices:
             changes[m] = {"change_24h": prices[m].get("change_pct", 0.0)}
 
-    # 3. Verify data
     verify_msg = verify_post_data(prices, changes)
     log("market_overview", f"VERIFY: {verify_msg}")
     if verify_msg != "OK":
         log("market_overview", "verify failed but proceeding")
 
-    # 4. OHLC for chart
     btc_ohlc = fetch_crypto_ohlc("BTC", days=7)
     ohlc = {"BTC": btc_ohlc}
 
-    # 5. Build chart
-    chart_path = f"posts/top5_btc_{ts.strftime('%Y%m%d_%H%M')}.png"
-    os.makedirs("posts", exist_ok=True)
+    chart_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "posts")
+    os.makedirs(chart_dir, exist_ok=True)
+    chart_path = os.path.join(chart_dir, f"top5_btc_{ts.strftime('%Y%m%d_%H%M')}.png")
     build_top5_chart(prices, ohlc, {}, {}, chart_path)
     log("market_overview", f"chart saved: {chart_path}")
 
-    # 6. Build text
     fng = fetch_fng()
     caption = build_caption(prices, changes, fng, ts)
     body = build_body(prices, changes, positional, fng, ts)
 
-    # 7. Post
     post_pair(str(chart_path), caption, body)
     log("market_overview", "posted OK")
 
