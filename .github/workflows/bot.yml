@@ -73,7 +73,7 @@ jobs:
             if [ "$WD" -ge 1 ] && [ "$WD" -le 5 ]; then
               if [ "$HOUR" = "04" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
                 JOB="morning_brief"
-              elif [ "$HOUR" = "0" ] && [ "$MIN" -ge "30" ] &b
+              elif [ "$HOUR" = "08" ] && [ "$MIN" -ge "30" ] && [ "$MIN" -lt "40" ]; then
                 JOB="market_overview"
               elif [ "$HOUR" = "09" ] && [ "$MIN" -ge "45" ] && [ "$MIN" -lt "55" ]; then
                 JOB="tiger_day"
@@ -81,12 +81,14 @@ jobs:
                 JOB="asian_review"
               fi
             elif [ "$WD" = "7" ]; then
+              if [ "$HOUR" = "15" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
                 JOB="weekly_preview"
               fi
             fi
+          fi
 
-          echo
-            mkdir`-p posts logs
+          echo "running job: ${JOB}"
+          mkdir -p posts logs
           set -euo pipefail
           export PYTHONPATH="${GITHUB_WORKSPACE:-.}"
           python jobs/${JOB}.py 2>&1 | tee logs/${JOB}_run.log
