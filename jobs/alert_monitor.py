@@ -13,8 +13,12 @@ from lib.post import alert_text
 
 logger = setup_logger("alert_monitor")
 
-# State file to remember previous price
-STATE_FILE = "/workspace/reddington-bot/posts/_alert_state.json"
+# State file to remember previous price.
+# Use path relative to repo root (cwd on runner is <repo>/jobs/..).
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_STATE_DIR = os.path.join(_REPO_ROOT, "posts")
+STATE_FILE = os.path.join(_STATE_DIR, "_alert_state.json")
 
 # Tier S thresholds
 FOMC_MIN_MOVE = 1.5  # % move during FOMC is automatic alert
@@ -36,6 +40,8 @@ def load_state():
 
 def save_state(state):
     import json
+    import os
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
