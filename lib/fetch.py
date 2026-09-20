@@ -65,7 +65,8 @@ def _from_binance(coin_id, symbol):
     try:
         _throttle("binance")
         url = "https://api.binance.com/api/v3/ticker/24hr"
-        params = {"symbol": f"{symbol}USDT"}
+        # symbol уже приходит с USDT (например "BTCUSDT"), Binance его и ждёт
+        params = {"symbol": symbol}
         r = _session.get(url, params=params, timeout=10)
         if r.status_code == 429:
             return None
@@ -87,7 +88,9 @@ def _from_kraken(coin_id, symbol):
     try:
         _throttle("kraken")
         kraken_pairs = {"BTC": "XBT", "DOGE": "XDG"}
-        base = kraken_pairs.get(symbol, symbol)
+        # strip USDT/USD → получить base ("BTCUSDT" → "BTC" → "XBT")
+        base_sym = symbol.replace("USDT", "").replace("USDC", "").replace("USD", "")
+        base = kraken_pairs.get(base_sym, base_sym)
         url = "https://api.kraken.com/0/public/Ticker"
         params = {"pair": f"{base}USD"}
         r = _session.get(url, params=params, timeout=10)
@@ -112,7 +115,9 @@ def _from_kraken(coin_id, symbol):
 def _from_coinbase(coin_id, symbol):
     try:
         _throttle("coinbase")
-        url = "https://api.coinbase.com/v2/prices/{}-USD/spot".format(symbol)
+        # symbol = "BTCUSDT" → strip USDT → "BTC" → URL = "BTC-USD" (200)
+        base_sym = symbol.replace("USDT", "").replace("USDC", "").replace("USD", "")
+        url = "https://api.coinbase.com/v2/prices/{}-USD/spot".format(base_sym)
         r = _session.get(url, timeout=10)
         r.raise_for_status()
         price = float(r.json()["data"]["amount"])
