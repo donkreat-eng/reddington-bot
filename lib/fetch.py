@@ -5,6 +5,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from statistics import median
+import statistics  # for statistics.median() in consensus_price
 
 import requests
 
@@ -65,7 +66,7 @@ def _from_binance(coin_id, symbol):
     try:
         _throttle("binance")
         url = "https://api.binance.com/api/v3/ticker/24hr"
-        # symbol уже приходит с USDT (например "BTCUSDT"), Binance его и ждёт
+        # symbol already includes USDT (e.g. "BTCUSDT"), Binance wants exactly that
         params = {"symbol": symbol}
         r = _session.get(url, params=params, timeout=10)
         if r.status_code == 429:
@@ -88,7 +89,7 @@ def _from_kraken(coin_id, symbol):
     try:
         _throttle("kraken")
         kraken_pairs = {"BTC": "XBT", "DOGE": "XDG"}
-        # strip USDT/USD → получить base ("BTCUSDT" → "BTC" → "XBT")
+        # strip USDT/USD → base symbol ("BTCUSDT" → "BTC" → "XBT")
         base_sym = symbol.replace("USDT", "").replace("USDC", "").replace("USD", "")
         base = kraken_pairs.get(base_sym, base_sym)
         url = "https://api.kraken.com/0/public/Ticker"
