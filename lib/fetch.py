@@ -1,66 +1,75 @@
 """Multi-source price fetching with median + retry."""
 import json
 import time
-import statistics
 import random
+import urllib.request
+import urllib.error
+import urllib.parse
+import statistics
+import logging
 from datetime import datetime, timezone
-from urllib.request import urlopen, Request
-from urllib.error import URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.common import setup_logger
-
-logger = setup_logger("fetch")
-
-TIMEOUT = 10
+logger = logging.getLogger("fetch")
+TIMEOUT = 12
+MAX_AGE_SEC = 120
 _LAST = {}
-USER_AGENT = "Mozilla/5.0 (compatible; ReddingtonBot/1.0)"
+
+# Per-source rate limit (seconds)
+_MIN_DELAY = {
+    "coingecko": 1.5,
+    "binance": 0.5,
+    "kraken": 1.0,
+    "coinbase": 0.5,
+    "coingecko_global": 2.0,
+    "coingecko_coin": 2.0,
+}
 
 
 def _throttle(name, min_delay=0.5):
     last = _LAST.get(name, 0)
-    now = time.time()
-    if now - last < min_delay:
-        time.sleep(min_delay - (now - last))
+    elapsed = time.time() - last
+    if elapsed < min_delay:
+        time.sleep(min_delay - elapsed)
     _LAST[name] = time.time()
 
 
 def _http(url, headers=None, timeout=TIMEOUT, throttle_name=None, min_delay=0.5):
+    """HTTP GET with throttle + error handling."""
     if throttle_name:
-        _throttle(throttle_name, min_delay)
-    req = Request(url)
-    req.add_header("User-Agent", USER_AGENT)
-    req.add_header("Accept", "application/json")
-    if headers:
-        for k, v in headers.items():
-            req.add_header(k, v)
+        _throttle(throttle_name, min_delay=min_delay)
+    else:
+        time.sleep(0.1)
+    req = urllib.request.Request(url, headers={"User-Agent": "reddington-bot/1.0", "Accept": "application/json", **(headers or {})})
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            if not body:
-                return None
-            return json.loads(body)
-    except (URLError, TimeoutError, json.JSONDecodeError) as e:
-        logger.warning(f"http fail {url[:80]}: {e}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            logger.warning(f"http 429 rate limit: {url[:80]}")
+        elif e.code == 451:
+            logger.warning(f"http 451 geo-blocked: {url[:80]}")
+        else:
+            logger.warning(f"http {e.code}: {url[:80]}")
         return None
     except Exception as e:
-        logger.warning(f"http error {url[:80]}: {e}")
+        logger.warning(f"http error: {e}")
         return None
 
 
 # === Source 1: CoinGecko ===
 def fetch_coingecko(coin_id="bitcoin", vs="usd"):
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs}&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true"
-    data = _http(url, throttle_name="coingecko", min_delay=2.0)
-    if not data or coin_id not in data:
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs}&include_24hr_change=true"
+    d = _http(url, throttle_name="coingecko", min_delay=1.5)
+    if not d or coin_id not in d:
         return None
-    d = data[coin_id]
+    block = d[coin_id]
     return {
         "source": "coingecko",
-        "price": float(d.get(vs, 0)),
-        "change_24h": float(d.get(f"{vs}_24h_change", 0)),
-        "volume_24h": float(d.get(f"{vs}_24h_vol", 0)),
-        "market_cap": float(d.get(f"{vs}_market_cap", 0)),
+        "price": float(block.get(vs, 0)),
+        "change_24h": float(block.get(f"{vs}_24h_change", 0)),
+        "volume_24h": 0,
         "ts": time.time(),
     }
 
@@ -68,57 +77,39 @@ def fetch_coingecko(coin_id="bitcoin", vs="usd"):
 # === Source 2: Binance ===
 def fetch_binance(symbol="BTCUSDT"):
     url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
-    data = _http(url, throttle_name="binance", min_delay=0.2)
-    if not data or "lastPrice" not in data:
+    data = _http(url, throttle_name="binance", min_delay=0.5)
+    if not data:
         return None
     return {
         "source": "binance",
-        "price": float(data["lastPrice"]),
+        "price": float(data.get("lastPrice", 0)),
         "change_24h": float(data.get("priceChangePercent", 0)),
         "volume_24h": float(data.get("quoteVolume", 0)),
-        "market_cap": 0,
         "ts": time.time(),
     }
 
 
-# === Source 3: CoinPaprika ===
-def fetch_paprika(symbol="btc-bitcoin", vs="usd"):
-    url = f"https://api.coinpaprika.com/v1/tickers/{symbol}?quotes={vs}"
-    data = _http(url, throttle_name="paprika", min_delay=1.0)
-    if not data or "quotes" not in data:
-        return None
-    q = data["quotes"].get(vs, {})
-    return {
-        "source": "paprika",
-        "price": float(q.get("price", 0)),
-        "change_24h": float(q.get("percent_change_24h", 0)),
-        "volume_24h": float(q.get("volume_24h", 0)),
-        "market_cap": float(q.get("market_cap", 0)),
-        "ts": time.time(),
-    }
-
-
-# === Source 4: Kraken ===
+# === Source 3: Kraken ===
 def fetch_kraken(symbol="BTCUSD"):
-    pair = symbol
-    if pair.endswith("USDT"):
-        pair = pair[:-1]  # BTCUSDT -> BTCUSD (Kraken uses USD not USDT)
-    url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
-    data = _http(url, throttle_name="kraken", min_delay=0.5)
+    url = f"https://api.kraken.com/0/public/Ticker?pair={symbol}"
+    data = _http(url, throttle_name="kraken", min_delay=1.0)
     if not data or "result" not in data or not data["result"]:
         return None
-    pair_data = next(iter(data["result"].values()))
+    pair_key = list(data["result"].keys())[0]
+    pair_data = data["result"][pair_key]
+    last = float(pair_data.get("c", ["0"])[0])
+    open_p = float(pair_data.get("o", 0))
+    change_pct = ((last - open_p) / open_p * 100) if open_p > 0 else 0
     return {
         "source": "kraken",
-        "price": float(pair_data["c"][0]),
-        "change_24h": float(pair_data.get("o", 0)) and
-                      (float(pair_data["c"][0]) - float(pair_data["o"])) / float(pair_data["o"]) * 100,
-        "volume_24h": float(pair_data.get("v", [0, 0])[1]),
+        "price": last,
+        "change_24h": change_pct,
+        "volume_24h": float(pair_data.get("v", [0])[1]),
         "ts": time.time(),
     }
 
 
-# === Source 5: Coinbase ===
+# === Source 4: Coinbase ===
 def fetch_coinbase(symbol="BTC-USD"):
     url = f"https://api.coinbase.com/v2/prices/{symbol}/spot"
     data = _http(url, throttle_name="coinbase", min_delay=0.5)
@@ -142,68 +133,76 @@ def fetch_ohlc(coin_id="bitcoin", vs="usd", days=7):
         "solana": "SOLUSDT",
         "binancecoin": "BNBUSDT",
         "ripple": "XRPUSDT",
-        "cardano": "ADAUSDT",
-        "avalanche-2": "AVAXUSDT",
-        "polkadot": "DOTUSDT",
-        "chainlink": "LINKUSDT",
-        "toncoin": "TONUSDT",
-        "sui": "SUIUSDT",
     }
-    symbol = symbol_map.get(coin_id, "BTCUSDT")
-    interval = "1h"
-    limit = days * 24 if days <= 30 else 500
-    url = (f"https://api.binance.com/api/v3/klines"
-           f"?symbol={symbol}&interval={interval}&limit={limit}")
-    data = _http(url, throttle_name="binance", min_delay=0.3)
-    if not data:
-        # Fallback to CoinGecko
-        url = (f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
-               f"?vs_currency={vs}&days={days}")
-        return _http(url, throttle_name="coingecko", min_delay=2.0)
-    # Binance klines: [openTime, open, high, low, close, volume, ...]
-    ohlc = []
-    for row in data:
-        ohlc.append([row[0], float(row[1]), float(row[2]), float(row[3]), float(row[4])])
-    return ohlc
+    symbol = symbol_map.get(coin_id, f"{coin_id.upper()}USDT")
+    interval = "1d" if days and days >= 1 else "1h"
+    limit = (days * 24) if interval == "1h" else min(days, 1000)
+
+    # Try Binance first
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = _http(url, throttle_name="binance", min_delay=0.5)
+    if data and isinstance(data, list) and len(data) > 0:
+        ohlc = []
+        for k in data:
+            ohlc.append({
+                "ts": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+            })
+        return ohlc
+
+    # Fallback: CoinGecko OHLC
+    cg_id = {"bitcoin": "bitcoin", "ethereum": "ethereum"}.get(coin_id, coin_id)
+    cg_url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/ohlc?vs_currency={vs}&days={days}"
+    cg_data = _http(cg_url, throttle_name="coingecko", min_delay=2.0)
+    if cg_data and isinstance(cg_data, list):
+        ohlc = []
+        for k in cg_data:
+            ohlc.append({
+                "ts": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+            })
+        return ohlc
+
+    return None
 
 
-# === Crypto detail (market cap + dominance) ===
-def _coingecko_coin(coin_id="bitcoin"):
-    """Fetch CoinGecko /coins/{id} market data. Returns market_cap (USD) or None."""
-    url = (f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-           f"?localization=false&tickers=false&community_data=false"
-           f"&developer_data=false&sparkline=false")
-    data = _http(url, throttle_name="coingecko", min_delay=2.0)
-    if not data or "market_data" not in data:
+# === Crypto detail: market cap + dominance ===
+def _coingecko_coin(coin_id="bitcoin", vs="usd"):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&community_data=false&developer_data=false"
+    d = _http(url, throttle_name="coingecko_coin", min_delay=2.0)
+    if not d or "market_data" not in d:
         return None
-    cap = (data.get("market_data") or {}).get("market_cap", {}).get("usd")
-    return float(cap) if cap else None
+    cap = (d["market_data"].get("market_cap") or {}).get(vs)
+    return {"market_cap": cap}
 
 
-def _coingecko_global():
-    """Fetch CoinGecko /global total market cap (USD). Returns float or None."""
+def _coingecko_global(vs="usd"):
     url = "https://api.coingecko.com/api/v3/global"
-    data = _http(url, throttle_name="coingecko", min_delay=2.0)
-    if not data or "data" not in data:
+    d = _http(url, throttle_name="coingecko_global", min_delay=2.0)
+    if not d or "data" not in d:
         return None
-    total = (data.get("data") or {}).get("total_market_cap", {}).get("usd")
-    return float(total) if total else None
+    total = (d["data"].get("total_market_cap") or {}).get(vs)
+    return {"total": total}
 
 
-def fetch_crypto_detail(coin_id="bitcoin"):
-    """Return {"market_cap": float|None, "dominance": float|None} for coin_id.
-
-    dominance is market_cap / total_market_cap * 100 (in %).
-    Returns dict with None values if CoinGecko is unavailable.
-    """
+def fetch_crypto_detail(coin_id="bitcoin", vs="usd"):
+    """Fetch market_cap + dominance for a coin via CoinGecko (parallel)."""
     cap = None
     total = None
     try:
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_cap = ex.submit(_coingecko_coin, coin_id)
-            f_total = ex.submit(_coingecko_global)
+            f_cap = ex.submit(_coingecko_coin, coin_id, vs)
+            f_total = ex.submit(_coingecko_global, vs)
             try:
-                cap = f_cap.result(timeout=10)
+                r = f_cap.result(timeout=10)
+                if r:
+                    cap = r["market_cap"]
             except Exception as e:
                 logger.warning(f"coingecko coin fetch failed: {e}")
             try:
@@ -249,26 +248,48 @@ def fetch_price_parallel(coin_id="bitcoin", symbol="BTCUSDT"):
     return results
 
 
-def consensus_price(results):
-    """Median across sources; flag spread."""
-    prices = [r["price"] for r in results.values() if r.get("price")]
-    if not prices:
-        return {"price": 0, "sources": [], "spread_pct": 0, "agreement": "no_data"}
-    med = statistics.median(prices)
-    if len(prices) >= 2:
-        spread = (max(prices) - min(prices)) / med * 100
+def consensus_price(results, max_age=MAX_AGE_SEC):
+    """Return verified price from multi-source fetch.
+    Returns dict with: price, change_24h, volume_24h, sources, agreement.
+    Raises ValueError on insufficient data."""
+    now = time.time()
+    fresh = [r for r in results.values() if (now - r["ts"]) <= max_age]
+    if not fresh:
+        raise ValueError("No fresh data from any source")
+
+    prices = [r["price"] for r in fresh]
+    median_p = statistics.median(prices)
+    spread = (max(prices) - min(prices)) / median_p * 100
+
+    if spread > 3.0:
+        # Try excluding outliers
+        sorted_p = sorted(prices)
+        trimmed = sorted_p[1:-1] if len(sorted_p) >= 3 else sorted_p
+        if trimmed:
+            median_p = statistics.median(trimmed)
+            spread = (max(trimmed) - min(trimmed)) / median_p * 100
+
+    # Use median change/volume from fresh sources
+    changes = [r.get("change_24h", 0) for r in fresh if "change_24h" in r and r.get("change_24h") is not None]
+    vols = [r.get("volume_24h", 0) for r in fresh if r.get("volume_24h")]
+
+    if spread < 0.3:
+        agreement = "OK"
+    elif spread < 1.0:
+        agreement = "MINOR_DRIFT"
+    elif spread < 3.0:
+        agreement = "MAJOR_DRIFT"
     else:
-        spread = 0
+        agreement = "CRITICAL"
+
     return {
-        "price": round(med, 2),
-        "sources": list(results.keys()),
+        "price": round(median_p, 2),
+        "change_24h": round(statistics.median(changes) if changes else 0, 2),
+        "volume_24h": max(vols) if vols else 0,
+        "sources": [r["source"] for r in fresh],
+        "agreement": agreement,
         "spread_pct": round(spread, 3),
-        "agreement": (
-            "tight" if spread < 0.5 else
-            "ok" if spread < 2 else
-            "wide"
-        ),
-        "raw": results,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -302,7 +323,4 @@ if __name__ == "__main__":
     import sys
     cid = sys.argv[1] if len(sys.argv) > 1 else "bitcoin"
     sym = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
-    detail = fetch_crypto_detail(cid)
-    print(f"detail: {detail}")
-    verified = fetch_with_retry(cid, sym, max_attempts=1, retry_delay=0)
-    print(f"verified: {verified['price']} via {verified['sources']}")
+    print(json.dumps(fetch_with_retry(cid, sym), indent=2))
