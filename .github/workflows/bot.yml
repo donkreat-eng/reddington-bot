@@ -59,3 +59,33 @@ jobs:
       - name: Run job
         env:
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          JOB="${{ github.event.inputs.job }}"
+          if [ -z "$JOB" ]; then
+            # Auto-detect from UTC time
+            HOUR=$(date -u +%H)
+            MIN=$(date -u +%M)
+            WD=$(date -u +%u)
+            JOB="alert_monitor"
+            if [ "$WD" -ge "1" ] && [ "$WD" -le "5" ]; then
+              if [ "$HOUR" = "04" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
+                JOB="morning_brief"
+              elif [ "$HOUR" = "08" ] && [ "$MIN" -ge "30" ] && [ "$MIN" -lt "40" ]; then
+                JOB="market_overview"
+              elif [ "$HOUR" = "09" ] && [ "$MIN" -ge "45" ] && [ "$MIN" -lt "55" ]; then
+                JOB="tiger_day"
+              elif [ "$HOUR" = "11" ] && [ "$MIN" -ge "15" ] && [ "$MIN" -lt "25" ]; then
+                JOB="asian_review"
+              fi
+            elif [ "$WD" = "7" ]; then
+              if [ "$HOUR" = "15" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
+                JOB="weekly_preview"
+              fi
+            fi
+          fi
+
+          echo "running job: ${JOB}"
+          mkdir -p posts logs
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE:-.}"
+          python jobs/${JOB}.py 2>&1 | tee logs/${JOB}_run.log
