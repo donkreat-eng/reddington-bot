@@ -15,7 +15,7 @@ from lib.post import tiger_caption, tiger_body
 
 logger = setup_logger("tiger_day")
 
-# Tier 2 rotation: 7 tickers, weekday rotation
+# Tiger 2 rotation: 7 tickers, weekday rotation
 TIGER_POOL = [
     {"coin_id": "ethereum", "symbol": "ETHUSDT", "ticker": "ETH / USDT"},
     {"coin_id": "solana", "symbol": "SOLUSDT", "ticker": "SOL / USDT"},
@@ -73,16 +73,16 @@ def build_data(tiger):
             "bias": "long",
             "support": support,
             "resistance": resistance,
-            "reason": "Самое сильное движение на рынке",
-            "drivers": ["Нет значимых нарративов"],
-            "fundamentals": ["Фундаментал без существенных изменений"],
-            "risks": ["Высокая волатильность рынка"],
+            "reason": "Тикер дня по ротации Тигр 2",
+            "drivers": ["📊 Ротация Тигр 2 в активной фазе"],
+            "fundamentals": ["✅ Тренд сохраняется"],
+            "risks": ["⚠️ Волатильность выше средней"],
             "scenarios": {
-                "base": "Боковик до следующего триггера",
-                "bull": "Пробой сопротивления с объёмом",
-                "bear": "Потеря поддержки → глубокая коррекция",
+                "base": "Боковик у текущих уровней",
+                "bull": "Пробой сопротивления и закрепление выше",
+                "bear": "Потеря поддержки — выход из позиции",
             },
-            "ps": "Следи за объёмами и реакцией на ключевые уровни",
+            "ps": "Следим за реакцией на ключевые уровни",
         }
     }
 
@@ -96,12 +96,15 @@ def main():
 
         ohlc = fetch_ohlc(tiger["coin_id"], "usd", days=7)
         if not ohlc:
-            logger.error(not ohlc:
-                logger.error(not ohlc:
-                logger.error(not ohlc:
+            logger.error("no OHLC data")
             return
 
-        chart_path = "/workspace/reddington-bot/posts/tiger_day.png"
+        # Absolute chart path (cwd on runner differs from jobs/)
+        repo_root = Path(__file__).resolve().parent.parent
+        chart_dir = repo_root / "posts"
+        chart_dir.mkdir(parents=True, exist_ok=True)
+        chart_path = str(chart_dir / "tiger_day.png")
+
         generate_chart(ohlc, tiger["ticker"], data["tiger"]["support"], data["tiger"]["resistance"], chart_path)
 
         caption = tiger_caption(data)
