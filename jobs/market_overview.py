@@ -26,7 +26,11 @@ from lib.common import load_env, setup_logger, ye_now, ye_str
 from lib.publish import post_pair, was_posted_recently, mark_posted
 
 load_env()
-log = setup_logger("market_overview")
+_logger = setup_logger("market_overview")
+
+
+def log(job, msg):
+    _logger.info(f"{job}: {msg}")
 
 CRYPTO_TICKERS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
 COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "SOL": "solana", "XRP": "ripple"}
@@ -388,7 +392,7 @@ def fmt_oi(usdt):
 def fmt_funding(f):
     if f is None:
         return "—"
-    sign = "+" if f >= 0 else "\u2212"
+    sign = "+" if f >= 0 else "−"
     return f"{sign}{abs(f):.3f}%"
 
 
