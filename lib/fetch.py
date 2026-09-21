@@ -29,7 +29,7 @@ def _http(url, throttle_name=None, min_delay=0.3):
         return None
 
 
-_LAST = {0}
+_LAST = {}
 def _throttle(name, min_delay):
     last = _LAST.get(name, 0)
     elapsed = time.time() - last
