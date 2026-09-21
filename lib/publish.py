@@ -104,12 +104,57 @@ def url_button(text, url):
     })
 
 
-def post_pair(photo_path, caption, body_text, reply_markup=None):
+def _dedup_state_path(job_name):
+    """Per-job state file for dedup checks."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo_root, "posts", f"_last_post_{job_name}.ts")
+
+
+def was_posted_recently(job_name, min_age_minutes):
+    """Return True if a post with this job_name was sent < min_age_minutes ago."""
+    if not job_name or min_age_minutes <= 0:
+        return False
+    p = _dedup_state_path(job_name)
+    if not os.path.exists(p):
+        return False
+    try:
+        last = float(open(p).read().strip() or 0)
+    except (ValueError, OSError):
+        return False
+    age_min = (time.time() - last) / 60.0
+    if age_min < min_age_minutes:
+        logger.info(f"dedup: {job_name} posted {age_min:.1f} min ago (< {min_age_minutes}), skipping")
+        return True
+    return False
+
+
+def mark_posted(job_name):
+    """Record timestamp of successful post for this job."""
+    if not job_name:
+        return
+    p = _dedup_state_path(job_name)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(str(time.time()))
+    except OSError as e:
+        logger.warning(f"could not write dedup state for {job_name}: {e}")
+
+
+def post_pair(photo_path, caption, body_text, reply_markup=None, job_name=None, min_age_minutes=60):
+    """Send photo+text pair to channel. If job_name is set, dedup against recent runs.
+
+    Returns dict with photo_id, text_id, and skipped=True if dedup hit.
+    """
+    if was_posted_recently(job_name, min_age_minutes):
+        return {"photo_id": None, "text_id": None, "skipped": True}
     logger.info(f"publishing to channel {CHAT_ID}")
     photo_mid = send_photo(photo_path, caption, reply_markup=reply_markup)
     time.sleep(1.0)
     text_mid = send_text(body_text, reply_markup=reply_markup)
-    return {"photo_id": photo_mid, "text_id": text_mid}
+    if photo_mid or text_mid:
+        mark_posted(job_name)
+    return {"photo_id": photo_mid, "text_id": text_mid, "skipped": False}
 
 
 def send_alert(text):
@@ -124,10 +169,15 @@ def post_donation_pinned(donate_url):
         "Любая сумма помогает нам делать больше разборов, "
         "улучшать бот и добавлять новые фичи.\n\n"
         "🔗 Нажмите кнопку ниже — откроется безопасный "
-        "инвойс от @CryptoBot (BTC, ETH, TON, USDT и др.)"
+        "инвойс от @CryptoBot (BTC, ETH, TON, USDT и др.).\n\n"
+        "🙏 Спасибо за поддержку!"
     )
     markup = url_button("💸 Поддержать REDDINGTON", donate_url)
-    mid = send_text(body, reply_markup=markup)
-    if mid:
-        pin_message(mid)
-    return mid
+    msg_id = send_text(body, reply_markup=markup)
+    if msg_id:
+        pin_message(msg_id, disable_notification=False)
+    return msg_id
+
+
+if __name__ == "__main__":
+    send_text(f"🟢 Reddington bot v1.0 — {ye_str()}\nПодключение проверено.")
