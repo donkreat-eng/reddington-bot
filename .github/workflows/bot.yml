@@ -30,7 +30,6 @@ on:
           - asian_review
           - weekly_preview
           - alert_monitor
-          - fix_asian_review
 
 jobs:
   post:
