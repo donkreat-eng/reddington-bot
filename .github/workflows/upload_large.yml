@@ -17,52 +17,62 @@ on:
         required: true
         type: string
       chunk_01:
-        description: 'Base64 chunk 1/10'
+        description: 'Base64 chunk 1/12'
         required: false
         type: string
         default: ''
       chunk_02:
-        description: 'Base64 chunk 2/10'
+        description: 'Base64 chunk 2/12'
         required: false
         type: string
         default: ''
       chunk_03:
-        description: 'Base64 chunk 3/10'
+        description: 'Base64 chunk 3/12'
         required: false
         type: string
         default: ''
       chunk_04:
-        description: 'Base64 chunk 4/10'
+        description: 'Base64 chunk 4/12'
         required: false
         type: string
         default: ''
       chunk_05:
-        description: 'Base64 chunk 5/10'
+        description: 'Base64 chunk 5/12'
         required: false
         type: string
         default: ''
       chunk_06:
-        description: 'Base64 chunk 6/10'
+        description: 'Base64 chunk 6/12'
         required: false
         type: string
         default: ''
       chunk_07:
-        description: 'Base64 chunk 7/10'
+        description: 'Base64 chunk 7/12'
         required: false
         type: string
         default: ''
       chunk_08:
-        description: 'Base64 chunk 8/10'
+        description: 'Base64 chunk 8/12'
         required: false
         type: string
         default: ''
       chunk_09:
-        description: 'Base64 chunk 9/10'
+        description: 'Base64 chunk 9/12'
         required: false
         type: string
         default: ''
       chunk_10:
-        description: 'Base64 chunk 10/10'
+        description: 'Base64 chunk 10/12'
+        required: false
+        type: string
+        default: ''
+      chunk_11:
+        description: 'Base64 chunk 11/12'
+        required: false
+        type: string
+        default: ''
+      chunk_12:
+        description: 'Base64 chunk 12/12'
         required: false
         type: string
         default: ''
@@ -90,6 +100,8 @@ jobs:
           CHUNK_08: ${{ inputs.chunk_08 }}
           CHUNK_09: ${{ inputs.chunk_09 }}
           CHUNK_10: ${{ inputs.chunk_10 }}
+          CHUNK_11: ${{ inputs.chunk_11 }}
+          CHUNK_12: ${{ inputs.chunk_12 }}
         with:
           script: |
             const chunks = [
@@ -103,6 +115,8 @@ jobs:
               process.env.CHUNK_08,
               process.env.CHUNK_09,
               process.env.CHUNK_10,
+              process.env.CHUNK_11,
+              process.env.CHUNK_12,
             ].filter(c => c && c.length > 0);
             const b64 = chunks.join('');
             const content = Buffer.from(b64, 'base64').toString('utf8');
