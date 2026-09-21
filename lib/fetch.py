@@ -1,33 +1,36 @@
-"""Price fetching with multi-source consensus and retry logic."""
+"""Multi-source price fetching with median + retry."""
 import json
 import time
-import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import statistics
+import random
 from datetime import datetime, timezone
-from statistics import median
-import statistics  # for statistics.median() in consensus_price
-
-import requests
-
+from urllib.request import urlopen, Request
+from urllib.error import URLError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from lib.common import setup_logger, log
 
 logger = setup_logger("fetch")
 
-# Per-source throttling — avoid 429 from public APIs
-_LAST = {}
-_MIN_DELAY = {
-    "coingecko": 2.0,
-    "binance": 0.2,
-    "kraken": 0.5,
-    "coinbase": 0.5,
-    "paprika": 1.0,
-}
-_session = requests.Session()
-_session.headers.update({"User-Agent": "reddington-bot/1.0"})
+_TIMEOUT = 10
+_MAX_AGE_SEC = 120
 
 
-def _throttle(name):
-    min_delay = _MIN_DELAY.get(name, 0.3)
+def _http(url, throttle_name=None, min_delay=0.3):
+    """HTTP GET with throttle + JSON parse. Returns dict or None."""
+    if throttle_name:
+        _throttle(throttle_name, min_delay)
+    try:
+        req = Request(url, headers={"User-Agent": "reddington-bot/1.0"})
+        with urlopen(req, timeout=_TIMEOUT) as r:
+            data = json.loads(r.read().decode())
+        return data
+    except (URLError, json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.warning(f"fetch fail {url[:80]}: {e}")
+        return None
+
+
+_LAST = {0}
+def _throttle(name, min_delay):
     last = _LAST.get(name, 0)
     elapsed = time.time() - last
     if elapsed < min_delay:
@@ -35,140 +38,156 @@ def _throttle(name):
     _LAST[name] = time.time()
 
 
-# --- Source: CoinGecko ---
-def _from_coingecko(coin_id, symbol):
-    try:
-        _throttle("coingecko")
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {"ids": coin_id, "vs_currencies": "usd", "include_24hr_change": "true",
-                  "include_24hr_vol": "true", "include_market_cap": "true"}
-        r = _session.get(url, params=params, timeout=10)
-        if r.status_code == 429:
-            return None
-        r.raise_for_status()
-        data = r.json().get(coin_id, {})
-        if "usd" not in data:
-            return None
-        return {
-            "source": "coingecko",
-            "price": float(data["usd"]),
-            "change_24h": float(data.get("usd_24h_change", 0)),
-            "volume_24h": float(data.get("usd_24h_vol", 0)),
-            "market_cap": float(data.get("usd_market_cap", 0)),
-        }
-    except Exception as e:
-        logger.warning(f"coingecko {coin_id} fail: {e}")
+# === Per-coin fetchers ===
+def fetch_coingecko(coin_id="bitcoin", vs="usd"):
+    """CoinGecko simple price."""
+    url = (f"https://api.coingecko.com/api/v3/simple/price"
+           f"?ids={coin_id}&vs_currencies={vs}"
+           f"&include_24hr_change=true&include_24hr_vol=true")
+    data = _http(url, throttle_name="coingecko", min_delay=1.5)
+    if not data or coin_id not in data or vs not in data[coin_id]:
         return None
+    d = data[coin_id]
+    return {
+        "source": "coingecko",
+        "price": float(d[vs]),
+        "change_24h": float(d.get(f"{vs}_24h_change", 0)),
+        "volume_24h": float(d.get(f"{vs}_24h_vol", 0)),
+        "market_cap": float(d.get(f"{vs}_market_cap", 0)),
+        "ts": time.time(),
+    }
 
 
-# --- Source: Binance ---
-def _from_binance(coin_id, symbol):
-    try:
-        _throttle("binance")
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        # symbol already includes USDT (e.g. "BTCUSDT"), Binance wants exactly that
-        params = {"symbol": symbol}
-        r = _session.get(url, params=params, timeout=10)
-        if r.status_code == 429:
-            return None
-        r.raise_for_status()
-        data = r.json()
-        return {
-            "source": "binance",
-            "price": float(data["lastPrice"]),
-            "change_24h": float(data["priceChangePercent"]),
-            "volume_24h": float(data["quoteVolume"]),
-        }
-    except Exception as e:
-        logger.warning(f"binance {symbol} fail: {e}")
+def fetch_binance(symbol="BTCUSDT"):
+    """Binance 24h ticker."""
+    url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+    data = _http(url, throttle_name="binance", min_delay=0.3)
+    if not data or "lastPrice" not in data:
         return None
+    return {
+        "source": "binance",
+        "price": float(data["lastPrice"]),
+        "change_24h": float(data["priceChangePercent"]),
+        "volume_24h": float(data["quoteVolume"]),
+        "ts": time.time(),
+    }
 
 
-# --- Source: Kraken ---
-def _from_kraken(coin_id, symbol):
-    try:
-        _throttle("kraken")
-        kraken_pairs = {"BTC": "XBT", "DOGE": "XDG"}
-        # strip USDT/USD → base symbol ("BTCUSDT" → "BTC" → "XBT")
-        base_sym = symbol.replace("USDT", "").replace("USDC", "").replace("USD", "")
-        base = kraken_pairs.get(base_sym, base_sym)
-        url = "https://api.kraken.com/0/public/Ticker"
-        params = {"pair": f"{base}USD"}
-        r = _session.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        result = r.json().get("result", {})
-        if not result:
-            return None
-        key = list(result.keys())[0]
-        t = result[key]
-        return {
-            "source": "kraken",
-            "price": float(t["c"][0]),
-            "change_24h": float(t.get("p", [0, 0])[0]) / float(t["o"]) * 100 if "o" in t else 0,
-            "volume_24h": float(t.get("v", [0, 0])[1]),
-        }
-    except Exception as e:
-        logger.warning(f"kraken {symbol} fail: {e}")
+def fetch_kraken(symbol="BTCUSD"):
+    """Kraken public ticker."""
+    url = f"https://api.kraken.com/0/public/Ticker?pair={symbol}"
+    data = _http(url, throttle_name="kraken", min_delay=0.5)
+    if not data or not data.get("result"):
         return None
+    result = data["result"]
+    key = list(result.keys())[0]
+    t = result[key]
+    return {
+        "source": "kraken",
+        "price": float(t["c"][0]),
+        "change_24h": 0,  # Kraken doesn't return % change in this endpoint
+        "volume_24h": float(t.get("v", [0, 0])[1]),
+        "ts": time.time(),
+    }
 
 
-# --- Source: Coinbase ---
-def _from_coinbase(coin_id, symbol):
-    try:
-        _throttle("coinbase")
-        # symbol = "BTCUSDT" → strip USDT → "BTC" → URL = "BTC-USD" (200)
-        base_sym = symbol.replace("USDT", "").replace("USDC", "").replace("USD", "")
-        url = "https://api.coinbase.com/v2/prices/{}-USD/spot".format(base_sym)
-        r = _session.get(url, timeout=10)
-        r.raise_for_status()
-        price = float(r.json()["data"]["amount"])
-        # Coinbase spot endpoint doesn't return 24h change; estimate 0
-        return {
-            "source": "coinbase",
-            "price": price,
-            "change_24h": 0.0,
-            "volume_24h": 0.0,
-        }
-    except Exception as e:
-        logger.warning(f"coinbase {symbol} fail: {e}")
+def fetch_coinbase(symbol="BTC-USD"):
+    """Coinbase spot price."""
+    url = f"https://api.coinbase.com/v2/prices/{symbol}/spot"
+    data = _http(url, throttle_name="coinbase", min_delay=0.5)
+    if not data or "data" not in data:
         return None
+    return {
+        "source": "coinbase",
+        "price": float(data["data"]["amount"]),
+        "change_24h": 0,
+        "volume_24h": 0,
+        "ts": time.time(),
+    }
 
 
-# --- Parallel fetch ---
-SOURCE_MAP = {
-    "coingecko": _from_coingecko,
-    "binance": _from_binance,
-    "kraken": _from_kraken,
-    "coinbase": _from_coinbase,
-}
+# === OHLC fetcher ===
+def fetch_ohlc(coin_id="bitcoin", vs="usd", days=7):
+    """Fetch OHLC candles. Prefer Binance klines (more reliable than CoinGecko OHLC)."""
+    symbol_map = {
+        "bitcoin": "BTCUSDT",
+        "ethereum": "ETHUSDT",
+        "solana": "SOLUSDT",
+        "binancecoin": "BNBUSDT",
+        "ripple": "XRPUSDT",
+        "cardano": "ADAUSDT",
+        "avalanche-2": "AVAXUSDT",
+        "polkadot": "DOTUSDT",
+        "chainlink": "LINKUSDT",
+        "toncoin": "TONUSDT",
+        "sui": "SUIUSDT",
+    }
+    symbol = symbol_map.get(coin_id, "BTCUSDT")
+    interval = "1h"
+    limit = days * 24 if days <= 30 else 500
+    url = (f"https://api.binance.com/api/v3/klines"
+           f"?symbol={symbol}&interval={interval}&limit={limit}")
+    data = _http(url, throttle_name="binance", min_delay=0.3)
+    if not data:
+        # Fallback to CoinGecko
+        url = (f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
+               f"?vs_currency={vs}&days={days}")
+        return _http(url, throttle_name="coingecko", min_delay=2.0)
+    # Binance klines: [openTime, open, high, low, close, volume, ...]
+    ohlc = []
+    for row in data:
+        ohlc.append([row[0], float(row[1]), float(row[2]), float(row[3]), float(row[4])])
+    return ohlc
 
 
-def fetch_price_parallel(coin_id, symbol):
-    """Fetch price from all sources in parallel. Return list of source results."""
+# === Multi-source parallel fetch ===
+def fetch_price_parallel(coin_id="bitcoin", symbol="BTCUSDT"):
+    """Fetch from all available sources in parallel."""
+    sources = [
+        ("coingecko", lambda: fetch_coingecko(coin_id)),
+        ("binance", lambda: fetch_binance(symbol)),
+        ("kraken", lambda: fetch_kraken(symbol.replace("USDT", "USD"))),
+        ("coinbase", lambda: fetch_coinbase(symbol.replace("USDT", "-USD"))),
+    ]
     results = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(fn, coin_id, symbol): name for name, fn in SOURCE_MAP.items()}
-        for fut in as_completed(futures):
-            res = fut.result()
-            if res:
-                results.append(res)
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {ex.submit(fn): name for name, fn in sources}
+        for fut in as_completed(futures, timeout=_TIMEOUT + 2):
+            name = futures[fut]
+            try:
+                r = fut.result()
+                if r:
+                    results.append(r)
+                    logger.info(f"  {name}: ${r['price']:,.2f}")
+            except Exception as e:
+                logger.warning(f"  {name} error: {e}")
     return results
 
 
-def consensus_price(results):
-    """Build a consensus: median price, agreement label, spread."""
-    if not results:
-        return None
-    trimmed = [r for r in results if r.get("price")]
-    if not trimmed:
-        return None
-    prices = [r["price"] for r in trimmed]
-    median_p = median(prices)
+def consensus_price(results, max_age=_MAX_AGE_SEC):
+    """Return verified price from multi-source fetch.
+    Returns dict with: price, change_24h, volume_24h, sources, agreement.
+    Raises ValueError on insufficient data."""
+    now = time.time()
+    fresh = [r for r in results if (now - r["ts"]) <= max_age]
+    if not fresh:
+        raise ValueError("No fresh data from any source")
+
+    prices = [r["price"] for r in fresh]
+    median_p = statistics.median(prices)
     spread = (max(prices) - min(prices)) / median_p * 100
 
+    if spread > 3.0:
+        # Try excluding outliers
+        sorted_p = sorted(prices)
+        trimmed = sorted_p[1:-1] if len(sorted_p) >= 3 else sorted_p
+        if trimmed:
+            median_p = statistics.median(trimmed)
+            spread = (max(trimmed) - min(trimmed)) / median_p * 100
+
     # Use median change/volume from fresh sources
-    changes = [r.get("change_24h", 0) for r in trimmed if "change_24h" in r]
-    vols = [r.get("volume_24h", 0) for r in trimmed if "volume_24h" in r]
+    changes = [r.get("change_24h", 0) for r in fresh if "change_24h" in r]
+    vols = [r.get("volume_24h", 0) for r in fresh if "volume_24h" in r]
 
     if spread < 0.3:
         agreement = "OK"
@@ -183,7 +202,7 @@ def consensus_price(results):
         "price": round(median_p, 2),
         "change_24h": round(statistics.median(changes) if changes else 0, 2),
         "volume_24h": max(vols) if vols else 0,
-        "sources": [r["source"] for r in trimmed],
+        "sources": [r["source"] for r in fresh],
         "agreement": agreement,
         "spread_pct": round(spread, 3),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
