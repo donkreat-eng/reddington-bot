@@ -1,5 +1,6 @@
-"""Weekly preview job — runs Sunday evening YEKT."""
+"""Weekly preview job — runs at 20:00 YEKT on Sunday."""
 import sys
+import os
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -16,32 +17,17 @@ logger = setup_logger("weekly_preview")
 def build_data():
     btc = fetch_with_retry("bitcoin", "BTCUSDT", max_attempts=2, retry_delay=10)
     eth = fetch_with_retry("ethereum", "ETHUSDT", max_attempts=2, retry_delay=10)
-
     return {
         "btc": btc,
         "eth": eth,
-        "week_range": ye_str(fmt="%d %b") + " — " + ye_str(fmt="%d %b"),
-        "fng": 50,
-        "fng_label": "Neutral",
-        "btc_dominance": "—",
-        "week_summary": [
-            "Рынок провёл неделю в режиме коррекции после ралли",
-            "BTC удержал ключевую поддержку и продолжил боковик",
+        "date_label": ye_str(fmt="%d %b %Y"),
+        "week_summary": "Неделя прошла с умеренной волатильностью, рынок консолидируется.",
+        "next_week_events": [
+            "Заседания ФРС и ЕЦБ — ключевое событие недели",
+            "Квартальные отчёты крупных технологических компаний",
+            "Обновления по ключевым криптопротоколам",
         ],
-        "week_lookahead": [
-            "Фокус — заседания ФРС и макроданные США",
-            "Следим за ликвидациями и динамикой фандинга",
-        ],
-        "week_events": [
-            "Заседания центробанков на этой неделе",
-        ],
-        "correlations": [
-            "DXY: умеренно-обратная",
-            "XAУ: положительная",
-        ],
-        "plan_base": "Боковик до прояснения",
-        "plan_aggr": "Доливка на откатах к поддержке",
-        "ps": "Следим за динамикой фандинга — агрессивные ставки могут спровоцировать коррекцию",
+        "levels_note": "Уровни рассчитаны от текущей цены",
     }
 
 
@@ -59,16 +45,18 @@ def main():
         support = (round(last * 0.97, 2), round(last * 0.985, 2))
         resistance = (round(last * 1.015, 2), round(last * 1.03, 2))
 
-        # Absolute chart path (cwd on runner differs from jobs/)
-        repo_root = Path(__file__).resolve().parent.parent
-        chart_dir = repo_root / "posts"
-        chart_dir.mkdir(parents=True, exist_ok=True)
-        chart_path = str(chart_dir / "weekly.png")
+        chart_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "posts")
+        os.makedirs(chart_dir, exist_ok=True)
+        chart_path = os.path.join(chart_dir, f"weekly_preview_{ye_str(fmt='%Y%m%d_%H%M')}.png")
         generate_chart(ohlc, "BTC / USDT", support, resistance, chart_path)
+
+        if not data.get("btc", {}).get("price"):
+            logger.error("btc price missing — skipping post")
+            return
 
         caption = weekly_caption(data)
         body = weekly_body(data)
-        result = post_pair(chart_path, caption, body)
+        result = post_pair(chart_path, caption, body, job_name="weekly_preview", min_age_minutes=60)
         logger.info(f"posted: {result}")
         logger.info("=== WEEKLY PREVIEW END ===")
     except Exception as e:
