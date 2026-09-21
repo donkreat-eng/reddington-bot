@@ -20,28 +20,28 @@ def build_data():
     return {
         "btc": btc,
         "eth": eth,
-        "week_range": ye_str(fmt="%d %b") + " – " + ye_str(fmt="%d %b"),
+        "week_range": ye_str(fmt="%d %b") + " — " + ye_str(fmt="%d %b"),
         "fng": 50,
         "fng_label": "Neutral",
         "btc_dominance": "—",
         "week_summary": [
-            "Рынок провёл неделю в режиме коррекции",
-            "BTC потерял позиции после локального максимума",
+            "Рынок провёл неделю в режиме коррекции после ралли",
+            "BTC удержал ключевую поддержку и продолжил боковик",
         ],
         "week_lookahead": [
-            "Главное событие — макро-календарь США",
-            "Ждём реакции на ключевые уровни",
+            "Фокус — заседания ФРС и макроданные США",
+            "Следим за ликвидациями и динамикой фандинга",
         ],
         "week_events": [
-            "Календарь на следующую неделю обновляется",
+            "Заседания центробанков на этой неделе",
         ],
         "correlations": [
-            "DXY: нейтрально",
-            "XAU: без значимых изменений",
+            "DXY: умеренно-обратная",
+            "XAУ: положительная",
         ],
-        "plan_base": "Торговля от уровней с короткими стопами",
-        "plan_aggr": "Увеличение позиции после подтверждения тренда",
-        "ps": "Главный триггер недели — заседание ФРС",
+        "plan_base": "Боковик до прояснения",
+        "plan_aggr": "Доливка на откатах к поддержке",
+        "ps": "Следим за динамикой фандинга — агрессивные ставки могут спровоцировать коррекцию",
     }
 
 
@@ -59,7 +59,11 @@ def main():
         support = (round(last * 0.97, 2), round(last * 0.985, 2))
         resistance = (round(last * 1.015, 2), round(last * 1.03, 2))
 
-        chart_path = "/workspace/reddington-bot/posts/weekly.png"
+        # Absolute chart path (cwd on runner differs from jobs/)
+        repo_root = Path(__file__).resolve().parent.parent
+        chart_dir = repo_root / "posts"
+        chart_dir.mkdir(parents=True, exist_ok=True)
+        chart_path = str(chart_dir / "weekly.png")
         generate_chart(ohlc, "BTC / USDT", support, resistance, chart_path)
 
         caption = weekly_caption(data)
