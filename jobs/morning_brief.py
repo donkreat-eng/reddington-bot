@@ -1,6 +1,7 @@
 """Morning brief job — runs at 09:00 YEKT."""
 import sys
 import json
+import os
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -74,7 +75,7 @@ def get_top_movers():
         losers = [m for m in losers_data if not is_stable(m)][:8]
         return {
             "gainers": [{"symbol": m["symbol"], "change": m.get("price_change_percentage_24h", 0)}
-                        for m in gainers],
+                       for m in gainers],
             "losers": [{"symbol": m["symbol"], "change": m.get("price_change_percentage_24h", 0)}
                        for m in losers],
         }
@@ -121,12 +122,9 @@ def main():
             logger.error("no OHLC data")
             return
 
-        # Use absolute chart path (cwd on runner may differ from jobs/)
-        repo_root = Path(__file__).resolve().parent.parent
-        chart_dir = repo_root / "posts"
-        chart_dir.mkdir(parents=True, exist_ok=True)
-        chart_path = str(chart_dir / "morning_brief.png")
-
+        chart_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "posts")
+        os.makedirs(chart_dir, exist_ok=True)
+        chart_path = os.path.join(chart_dir, f"morning_brief_{ye_str(fmt='%Y%m%d_%H%M')}.png")
         last_close = data["btc"]["price"]
         support = (round(last_close * 0.97, 2), round(last_close * 0.985, 2))
         resistance = (round(last_close * 1.015, 2), round(last_close * 1.03, 2))
@@ -137,7 +135,12 @@ def main():
         caption = morning_brief_caption(data, {"btc_dominance": data["btc_dominance"]})
         body = morning_brief_body(data)
 
-        result = post_pair(chart_path, caption, body)
+        # Sanity check: don't post empty briefs
+        if not data.get("btc", {}).get("price"):
+            logger.error("btc price missing — skipping post")
+            return
+
+        result = post_pair(chart_path, caption, body, job_name="morning_brief", min_age_minutes=60)
         logger.info(f"posted: {result}")
         logger.info("=== MORNING BRIEF END ===")
 
