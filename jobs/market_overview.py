@@ -1,1 +1,1 @@
-"""13:30 YEKT market overview — BTC/ETH/BNB
+"""13:30 YEKT market overview — BTC/ETH/BNB/SOL/XRP + Gold/Silver.
