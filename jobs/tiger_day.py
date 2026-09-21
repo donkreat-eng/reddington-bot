@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.common import setup_logger, ye_now, ye_str
-from lib.fetch import fetch_with_retry, fetch_ohlc
+from lib.fetch import fetch_with_retry, fetch_ohlc, fetch_crypto_detail
 from lib.chart import generate_chart
 from lib.publish import post_pair
 from lib.post import tiger_caption, tiger_body
@@ -63,14 +63,19 @@ def build_data(tiger):
     if resistance[1] <= resistance[0]:
         resistance = (round(last * 1.04, 4), round(last * 1.07, 4))
 
+    # Market cap + dominance via CoinGecko
+    detail = fetch_crypto_detail(tiger["coin_id"])
+
     return {
         "tiger": {
             "ticker": tiger["ticker"],
             "price": last,
             "change_24h": data.get("change_24h", 0),
             "change_7d": 0,
-            "market_cap": data.get("market_cap", 0),
-            "dominance": "—",
+            "market_cap": detail.get("market_cap") or 0,
+            "dominance": (
+                f"{detail['dominance']:.2f}%" if detail.get("dominance") is not None else "—"
+            ),
             "bias": "long",
             "support": support,
             "resistance": resistance,
