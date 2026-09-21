@@ -74,9 +74,9 @@ def get_top_movers():
         losers = [m for m in losers_data if not is_stable(m)][:8]
         return {
             "gainers": [{"symbol": m["symbol"], "change": m.get("price_change_percentage_24h", 0)}
-                       for m in gainers,
+                        for m in gainers],
             "losers": [{"symbol": m["symbol"], "change": m.get("price_change_percentage_24h", 0)}
-                        for m in losers],
+                       for m in losers],
         }
     except Exception as e:
         logger.warning(f"movers fetch failed: {e}")
@@ -121,7 +121,12 @@ def main():
             logger.error("no OHLC data")
             return
 
-        chart_path = "/workspace/reddington-bot/posts/morning_brief.png"
+        # Use absolute chart path (cwd on runner may differ from jobs/)
+        repo_root = Path(__file__).resolve().parent.parent
+        chart_dir = repo_root / "posts"
+        chart_dir.mkdir(parents=True, exist_ok=True)
+        chart_path = str(chart_dir / "morning_brief.png")
+
         last_close = data["btc"]["price"]
         support = (round(last_close * 0.97, 2), round(last_close * 0.985, 2))
         resistance = (round(last_close * 1.015, 2), round(last_close * 1.03, 2))
