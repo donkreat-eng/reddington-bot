@@ -1,32 +1,30 @@
-"""Tiger Day — daily Tier-2 spotlight (1 ticker per weekday)."""
+"""Tiger day job — runs at 14:45 YEKT, weekday rotation through Tier 2."""
 import sys
-from datetime import datetime, timezone
+import os
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.common import setup_logger, ye_now, ye_str
 from lib.fetch import fetch_with_retry, fetch_ohlc, fetch_crypto_detail
-from lib.publish import post_pair, was_posted_recently, mark_posted
-from lib.post import tiger_caption, tiger_body, generate_chart
-from lib.common import setup_logger, load_env
+from lib.chart import generate_chart
+from lib.publish import post_pair
+from lib.post import tiger_caption, tiger_body
 
-load_env()
-_logger = setup_logger("tiger_day")
+logger = setup_logger("tiger_day")
 
-
-def log(job, msg):
-    _logger.info(f"{job}: {msg}")
-
-
-# Tier-2 pool: rotate by ISO weekday (Mon=1 .. Fri=5)
+# Tier 2 rotation: 7 tickers, weekday rotation
 TIGER_POOL = [
-    {"coin_id": "ethereum", "symbol": "ETHUSDT", "ticker": "ETH"},
-    {"coin_id": "solana", "symbol": "SOLUSDT", "ticker": "SOL"},
-    {"coin_id": "binancecoin", "symbol": "BNBUSDT", "ticker": "BNB"},
-    {"coin_id": "ripple", "symbol": "XRPUSDT", "ticker": "XRP"},
-    {"coin_id": "avalanche-2", "symbol": "AVAXUSDT", "ticker": "AVAX"},
+    {"coin_id": "ethereum", "symbol": "ETHUSDT", "ticker": "ETH / USDT"},
+    {"coin_id": "solana", "symbol": "SOLUSDT", "ticker": "SOL / USDT"},
+    {"coin_id": "ripple", "symbol": "XRPUSDT", "ticker": "XRP / USDT"},
+    {"coin_id": "sui", "symbol": "SUIUSDT", "ticker": "SUI / USDT"},
+    {"coin_id": "chainlink", "symbol": "LINKUSDT", "ticker": "LINK / USDT"},
+    {"coin_id": "toncoin", "symbol": "TONUSDT", "ticker": "TON / USDT"},
+    {"coin_id": "avalanche-2", "symbol": "AVAXUSDT", "ticker": "AVAX / USDT"},
 ]
-
-
-def ye_now():
-    return datetime.now(timezone.utc)  # cron uses UTC; bot.yml converts YEKT to UTC
 
 
 def pick_tiger():
@@ -47,66 +45,83 @@ def build_data(tiger):
         support = (round(last * 0.95, 2), round(last * 0.97, 2))
         resistance = (round(last * 1.03, 2), round(last * 1.05, 2))
     elif last >= 10:
-        # Mid-cap: 4% / 6% bands
-        support = (round(last * 0.94, 2), round(last * 0.96, 2))
-        resistance = (round(last * 1.04, 2), round(last * 1.06, 2))
+        # Mid-cap: 5% / 7% bands
+        support = (round(last * 0.93, 3), round(last * 0.96, 3))
+        resistance = (round(last * 1.04, 3), round(last * 1.07, 3))
+    elif last >= 1:
+        # Low-cap: 7% / 10% bands, 4 decimals
+        support = (round(last * 0.90, 4), round(last * 0.95, 4))
+        resistance = (round(last * 1.05, 4), round(last * 1.10, 4))
     else:
-        # Low-cap: 6% / 8% bands
-        support = (round(last * 0.92, 2), round(last * 0.94, 2))
-        resistance = (round(last * 1.06, 2), round(last * 1.08, 2))
+        # Micro-cap: 12% / 15% bands, 6 decimals
+        support = (round(last * 0.85, 6), round(last * 0.92, 6))
+        resistance = (round(last * 1.08, 6), round(last * 1.15, 6))
 
-    # 7d OHLC for the chart
-    ohlc = []
-    try:
-        ohlc = fetch_ohlc(tiger["coin_id"], "usd", days=7) or []
-    except Exception as e:
-        log("tiger_day", f"ohlc fetch failed: {e}")
+    # Ensure zones don't overlap and have at least 1% width
+    if support[1] <= support[0]:
+        support = (round(last * 0.93, 4), round(last * 0.96, 4))
+    if resistance[1] <= resistance[0]:
+        resistance = (round(last * 1.04, 4), round(last * 1.07, 4))
 
-    # Real market cap + dominance from CoinGecko
+    # Market cap + dominance via CoinGecko
     detail = fetch_crypto_detail(tiger["coin_id"])
 
     return {
         "tiger": {
-            **tiger,
+            "ticker": tiger["ticker"],
             "price": last,
-            "support": support[1],
-            "support_low": support[0],
-            "resistance": resistance[0],
-            "resistance_high": resistance[1],
-            "market_cap": detail.get("market_cap") or 0,
-            "dominance": detail.get("dominance"),
-            "ohlc": ohlc,
-            "spread_pct": data.get("spread_pct"),
-            "sources": data.get("sources", []),
             "change_24h": data.get("change_24h", 0),
-            "volume_24h": data.get("volume_24h", 0),
-        },
-        "now": ye_now().isoformat(),
+            "change_7d": 0,
+            "market_cap": detail.get("market_cap") or 0,
+            "dominance": (
+                f"{detail['dominance']:.2f}%" if detail.get("dominance") is not None else "—"
+            ),
+            "bias": "long",
+            "support": support,
+            "resistance": resistance,
+            "reason": "Самое сильное движение на рынке",
+            "drivers": ["Нет значимых нарративов"],
+            "fundamentals": ["Фундаментал без существенных изменений"],
+            "risks": ["Высокая волатильность рынка"],
+            "scenarios": {
+                "base": "Боковик до следующего триггера",
+                "bull": "Пробой сопротивления с объёмом",
+                "bear": "Потеря поддержки → глубокая коррекция",
+            },
+            "ps": "Следи за объёмами и реакцией на ключевые уровни",
+        }
     }
 
 
 def main():
-    tiger = pick_tiger()
-    log("tiger_day", f"today's tiger: {tiger['ticker']}")
-
-    data = build_data(tiger)
-    caption = tiger_caption(data["tiger"])
-    body = tiger_body(data["tiger"])
-
-    if was_posted_recently("tiger_day", data["tiger"]["ticker"], within_minutes=60):
-        log("tiger_day", f"skip: {data['tiger']['ticker']} already posted in last hour")
-        return
-
-    chart_path = f"posts/tiger_day_{data['tiger']['ticker'].replace('/', '_')}.png"
     try:
-        generate_chart(data["tiger"]["ohlc"], data["tiger"]["ticker"], data["tiger"]["support"], data["tiger"]["resistance"], chart_path)
-    except Exception as e:
-        log("tiger_day", f"chart failed: {e}")
-        chart_path = None
+        logger.info("=== TIGER DAY START ===")
+        tiger = pick_tiger()
+        logger.info(f"today's tiger: {tiger['ticker']}")
+        data = build_data(tiger)
 
-    result = post_pair(chart_path, caption, body)
-    mark_posted("tiger_day")
-    log("tiger_day", f"posted: {result}")
+        ohlc = fetch_ohlc(tiger["coin_id"], "usd", days=7)
+        if not ohlc:
+            logger.error("no OHLC data")
+            return
+
+        chart_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "posts")
+        os.makedirs(chart_dir, exist_ok=True)
+        chart_path = os.path.join(chart_dir, f"tiger_day_{tiger['ticker'].replace('/', '_')}.png")
+        generate_chart(ohlc, tiger["ticker"], data["tiger"]["support"], data["tiger"]["resistance"], chart_path)
+
+        if not data.get("tiger", {}).get("price"):
+            logger.error("tiger price missing — skipping post")
+            return
+
+        caption = tiger_caption(data)
+        body = tiger_body(data)
+        result = post_pair(chart_path, caption, body, job_name="tiger_day", min_age_minutes=60)
+        logger.info(f"posted: {result}")
+        logger.info("=== TIGER DAY END ===")
+    except Exception as e:
+        logger.error(f"FAILED: {e}")
+        raise
 
 
 if __name__ == "__main__":
