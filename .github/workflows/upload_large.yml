@@ -1,0 +1,120 @@
+name: Upload large file (base64 chunks)
+
+on:
+  workflow_dispatch:
+    inputs:
+      path:
+        description: 'Path in repo'
+        required: true
+        type: string
+      sha:
+        description: 'Current blob SHA (empty for new file)'
+        required: false
+        type: string
+        default: ''
+      message:
+        description: 'Commit message'
+        required: true
+        type: string
+      chunk_01:
+        description: 'Base64 chunk 1/10'
+        required: false
+        type: string
+        default: ''
+      chunk_02:
+        description: 'Base64 chunk 2/10'
+        required: false
+        type: string
+        default: ''
+      chunk_03:
+        description: 'Base64 chunk 3/10'
+        required: false
+        type: string
+        default: ''
+      chunk_04:
+        description: 'Base64 chunk 4/10'
+        required: false
+        type: string
+        default: ''
+      chunk_05:
+        description: 'Base64 chunk 5/10'
+        required: false
+        type: string
+        default: ''
+      chunk_06:
+        description: 'Base64 chunk 6/10'
+        required: false
+        type: string
+        default: ''
+      chunk_07:
+        description: 'Base64 chunk 7/10'
+        required: false
+        type: string
+        default: ''
+      chunk_08:
+        description: 'Base64 chunk 8/10'
+        required: false
+        type: string
+        default: ''
+      chunk_09:
+        description: 'Base64 chunk 9/10'
+        required: false
+        type: string
+        default: ''
+      chunk_10:
+        description: 'Base64 chunk 10/10'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge chunks and commit
+        uses: actions/github-script@v7
+        env:
+          PATH_INPUT: ${{ inputs.path }}
+          SHA_INPUT: ${{ inputs.sha }}
+          MSG_INPUT: ${{ inputs.message }}
+          CHUNK_01: ${{ inputs.chunk_01 }}
+          CHUNK_02: ${{ inputs.chunk_02 }}
+          CHUNK_03: ${{ inputs.chunk_03 }}
+          CHUNK_04: ${{ inputs.chunk_04 }}
+          CHUNK_05: ${{ inputs.chunk_05 }}
+          CHUNK_06: ${{ inputs.chunk_06 }}
+          CHUNK_07: ${{ inputs.chunk_07 }}
+          CHUNK_08: ${{ inputs.chunk_08 }}
+          CHUNK_09: ${{ inputs.chunk_09 }}
+          CHUNK_10: ${{ inputs.chunk_10 }}
+        with:
+          script: |
+            const chunks = [
+              process.env.CHUNK_01,
+              process.env.CHUNK_02,
+              process.env.CHUNK_03,
+              process.env.CHUNK_04,
+              process.env.CHUNK_05,
+              process.env.CHUNK_06,
+              process.env.CHUNK_07,
+              process.env.CHUNK_08,
+              process.env.CHUNK_09,
+              process.env.CHUNK_10,
+            ].filter(c => c && c.length > 0);
+            const b64 = chunks.join('');
+            const content = Buffer.from(b64, 'base64').toString('utf8');
+            const sha = process.env.SHA_INPUT || undefined;
+            const params = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path: process.env.PATH_INPUT,
+              message: process.env.MSG_INPUT,
+              content: Buffer.from(content).toString('base64'),
+              branch: 'main',
+            };
+            if (sha) params.sha = sha;
+            const res = await github.rest.repos.createOrUpdateFileContents(params);
+            console.log(`committed: ${res.data.commit.sha} size=${res.data.content.size}`);
