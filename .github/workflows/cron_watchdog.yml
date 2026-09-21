@@ -1,0 +1,48 @@
+name: Cron Watchdog
+
+# Watchdog for GitHub Actions scheduled workflow delays/drops.
+# Runs every 5 minutes. If bot.yml hasn't run for >= 8 minutes, dispatches it.
+# This way, even if the `schedule:` cron in bot.yml gets stuck or delayed,
+# the watchdog keeps firing the right job every cycle.
+
+on:
+  schedule:
+    # Every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Dispatch bot.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Read last successful bot.yml run from API
+          LAST_RUN=$(curl -s \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/bot.yml/runs?per_page=1&status=completed" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); r=d['workflow_runs'][0] if d['workflow_runs'] else None; print(r['updated_at'] if r else 'never')")
+          echo "last bot.yml run: $LAST_RUN"
+
+          # Compute age in minutes
+          NOW=$(date -u +%s)
+          LAST_TS=$(date -u -d "$LAST_RUN" +%s 2>/dev/null || echo 0)
+          AGE_MIN=$(( (NOW - LAST_TS) / 60 ))
+          echo "age: ${AGE_MIN} min"
+
+          # If bot.yml last run is older than 8 minutes, redispatch it
+          if [ "$AGE_MIN" -ge 8 ]; then
+            echo "bot.yml last ran ${AGE_MIN} min ago — redispatching"
+            curl -s -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/bot.yml/dispatches" \
+              -d '{"ref":"main"}'
+            echo "redispatched"
+          else
+            echo "bot.yml is fresh (${AGE_MIN} min) — no action"
+          fi
