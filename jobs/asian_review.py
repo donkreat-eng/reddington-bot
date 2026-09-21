@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.common import setup_logger, ye_str
 from lib.fetch import fetch_with_retry
-from lib.publish import send_text
+from lib.publish import send_text, was_posted_recently, mark_posted
 from lib.post import asian_caption, asian_body
 
 logger = setup_logger("asian_review")
@@ -36,14 +36,23 @@ def build_data():
 def main():
     try:
         logger.info("=== ASIAN REVIEW START ===")
+        if was_posted_recently("asian_review", 60):
+            logger.info("skipped: posted <60 min ago")
+            return
+
         data = build_data()
+        if not data.get("btc", {}).get("price"):
+            logger.error("btc price missing — skipping post")
+            return
+
         caption = asian_caption(data)
         body = asian_body(data)
 
         # Send caption as photo-less message + body as follow-up text
-        from publish import send_text
-        send_text(caption)
-        send_text(body)
+        mid1 = send_text(caption)
+        mid2 = send_text(body)
+        if mid1 or mid2:
+            mark_posted("asian_review")
         logger.info("posted (text-only)")
         logger.info("=== ASIAN REVIEW END ===")
     except Exception as e:
