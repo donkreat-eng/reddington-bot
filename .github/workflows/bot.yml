@@ -11,9 +11,7 @@ on:
     # Asian review — Mon-Fri 11:15 UTC = 16:15 YEKT
     - cron: '15 11 * * 1-5'
     # Weekly preview — Sunday 15:00 UTC = 20:00 YEKT
-    - cron: '0 15 * * 0'
-    # Alert monitor — every 10 minutes
-    - cron: '*/10 * * * *'
+    - cron: '0 15 * * * 0'
 
   workflow_dispatch:
     inputs:
@@ -29,7 +27,6 @@ on:
           - tiger_day
           - asian_review
           - weekly_preview
-          - alert_monitor
 
 jobs:
   post:
@@ -59,14 +56,18 @@ jobs:
         env:
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          JOB="${{ github.event.inputs.job }}"
-          if [ -z "$JOB" ]; then
-            # Auto-detect from UTC time
+          # Determine which job to run based on time (or manual override)
+          INPUT_JOB="${{ inputs.job }}"
+          if [ -n "$INPUT_JOB" ]; then
+            JOB="$INPUT_JOB"
+          else
             HOUR=$(date -u +%H)
             MIN=$(date -u +%M)
-            WD=$(date -u +%u)
-            JOB="alert_monitor"
-            if [ "$WD" -ge "1" ] && [ "$WD" -le "5" ]; then
+            WD=$(date -u +%u)  # 1=Mon..7=Sun
+            echo "UTC time: ${HOUR}:${MIN}, weekday: ${WD}"
+
+            JOB="none"
+            if [ "$WD" -ge 1 ] && [ "$WD" -le 5 ]; then
               if [ "$HOUR" = "04" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
                 JOB="morning_brief"
               elif [ "$HOUR" = "08" ] && [ "$MIN" -ge "30" ] && [ "$MIN" -lt "40" ]; then
@@ -87,4 +88,8 @@ jobs:
           mkdir -p posts logs
           set -euo pipefail
           export PYTHONPATH="${GITHUB_WORKSPACE:-.}"
+          if [ "$JOB" = "none" ]; then
+            echo "no scheduled job for this UTC time — skipping"
+            exit 0
+          fi
           python jobs/${JOB}.py 2>&1 | tee logs/${JOB}_run.log
