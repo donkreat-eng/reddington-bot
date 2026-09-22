@@ -19,7 +19,6 @@ on:
         description: 'Which job to run (or empty for auto-detect by UTC time)'
         required: false
         type: choice
-        default: ''
         options:
           - ''
           - morning_brief
@@ -38,10 +37,10 @@ jobs:
       REDDINGTON_CHANNEL_ID: ${{ secrets.REDDINGTON_CHANNEL_ID }}
       REDDINGTON_CHANNEL_NAME: 'Reddington Trade'
     steps:
+      - uses: actions/checkout@v4
+
       - name: Set up job
         run: echo "post job starting"
-
-      - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
@@ -51,7 +50,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pillow
+          pip install -r requirements.txt
 
       - name: Run cron watchdog guard
         run: |
@@ -63,6 +62,7 @@ jobs:
 
       - name: Run job
         env:
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           INPUT_JOB: ${{ inputs.job }}
         run: |
           set -euo pipefail
@@ -94,6 +94,7 @@ jobs:
             echo "no scheduled job for this UTC time — skipping"
             exit 0
           fi
+          mkdir -p posts logs
           python jobs/${JOB}.py 2>&1 | tee logs/${JOB}_run.log
 
       - name: Notify completion
