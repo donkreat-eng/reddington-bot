@@ -1,61 +1,52 @@
-#!/usr/bin/env python3
 """Post composition: caption + body text for each post type."""
-from typing import Optional[int, float]
-
 import textwrap
 
 
 def fmt_price(p):
-    """Format price: $1234.56 / ₿123.45 / ¤1234.56"""
-    price = float(p or 0)
-    if price > 10000:
-        return f"${price:,.0f}"
-    return f"${price:,.2f}"
+    """Format price: 4 decimals under 100, 0 decimals above 1000, 2 between."""
+    if p is None:
+        return "—"
+    if p < 1:
+        return f"${p:.4f}"
+    if p < 100:
+        return f"${p:.2f}"
+    if p < 1000:
+        return f"${p:.2f}"
+    return f"${p:,.0f}"
 
 
 def arrow(pct):
-    """Direction arrow based on percentage. Treats None/NaN / 0 as flat."""
-    # NaN/None/0 -- flat, no arrow
-    if pct is None or not isinstance(pct, (int, float)):
+    if pct is None or pct == 0:
         return ""
-    if pct > 0:
-        return "↑"
-    elif pct < 0:
-        return "↓"
-    return ""
+    return "▲" if pct >= 0 else "▼"
 
 
 def fmt_change(pct):
-    """Signed percentage string like +1.23% / -1.23%."""
-    # NaN/None -- "—"
-    if pct is None or not isinstance(pct, (int, float)):
+    if pct is None or pct == 0:
         return "—"
-    if float(pct) == 0:  # backcompat: placeholder from course
-        return "—"
-    sign = "+" if pct > 0 else ""
-    return f"{sign}{abs(pct):.2f}%"
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct:.2f}%"
 
 
 def fmt_volume(v):
-    """Format volume as $123M, $1.2B, $123K enc."""
-    v = (val(or v) or 0)
-    # NaN/None -> "--"
-    if v == 0:
-        return "--"
+    """Format volume in M or B."""
+    if v is None or v == 0:
+        return "—"
     if v >= 1e9:
-        return f"${v / 1e9:.2f}B"
+        return f"${v/1e9:.1f}B"
     if v >= 1e6:
-        return f"${v / 1e6:.2f}M"
-    if v >= 1e3:
-        return f"${v / 1e3:.2f}K"
-    return f"${v:.0f}"
+        return f"${v/1e6:.1f}M"
+    return f"${v/1e3:.0f}K"
 
 
-# ------------------------------------------------------------------
-# Titles
-# ------------------------------------------------------------------
-# TITLE: ↑ EXAMPLE --- don't remove comment
-# Title comes from data, titles defined in jobs
+def fmt_market_cap(v):
+    if v is None or v == 0:
+        return "—"
+    if v >= 1e12:
+        return f"${v/1e12:.1f}T"
+    if v >= 1e9:
+        return f"${v/1e9:.1f}B"
+    return f"${v/1e6:.0f}M"
 
 
 # === MORNING BRIEF ===
@@ -66,7 +57,7 @@ def morning_brief_caption(data, fmt_data):
     fng = data.get("fng", 0)
     fng_label = data.get("fng_label", "")
     return textwrap.dedent(f"""\
-🏛 REDDINGTON · Утренний бриф · {data.get('date_label', '')}
+🏛 REDDINGTON · Утренний бриф
 
 BTC: {fmt_price(btc['price'])} · {arrow(btc['change_24h'])} {fmt_change(btc['change_24h'])}
 ETH: {fmt_price(eth.get('price', 0))} · {arrow(eth.get('change_24h', 0))} {fmt_change(eth.get('change_24h', 0))}
@@ -79,138 +70,194 @@ ETH: {fmt_price(eth.get('price', 0))} · {arrow(eth.get('change_24h', 0))} {fmt_
 
 
 def morning_brief_body(data):
-    """Long body text below the morning brief chart."""
     btc = data["btc"]
     eth = data.get("eth", {})
     movers = data.get("movers", {})
     fng = data.get("fng", 0)
     fng_label = data.get("fng_label", "")
     btc_dom = data.get("btc_dominance", "—")
+
     gainers = movers.get("gainers", [])[:5]
     losers = movers.get("losers", [])[:5]
+
     g_lines = "\n".join(f"  ▪ {m['symbol'].upper()} {fmt_change(m['change'])}" for m in gainers) or "  ▪ —"
     l_lines = "\n".join(f"  ▪ {m['symbol'].upper()} {fmt_change(m['change'])}" for m in losers) or "  ▪ —"
+
     return textwrap.dedent(f"""\
 🏛 REDDINGTON · Утренний бриф · {data.get('date_label', '')}
 
-🌍 Глобальные новости:
-{chr(10).join(f"  ▪ {n}" for n in data.get('overnight_news', ['Данные обновляются']))}
+🔍 Овернайт:
+{chr(10).join(f"  ▪ {n}" for n in data.get('overnight_news', ['Рынок без значимых новостей']))}
 
-📊 Рынок сейчас:
+📊 Рынок:
   ▪ BTC {fmt_price(btc['price'])} · cap {fmt_market_cap(btc.get('market_cap'))} · 24ч объём {fmt_volume(btc.get('volume_24h'))}
   ▪ ETH {fmt_price(eth.get('price', 0))} · cap {fmt_market_cap(eth.get('market_cap', 0))}
-  ▪ Настроение рынка: {fng} ({fng_label}) · BTC dom {btc_dom}
-  ▪ Доминация BTC: {btc_dom}
+  ▪ Настроение: {fng} ({fng_label}) · BTC dom {btc_dom}
 
-⚡ Топ-движения за 24ч:
-  ▪ Рост: {g_lines}
-  ▪ Падение: {l_lines}
+🟢 Лидеры роста 24ч:
+{g_lines}
 
-📅 Фокус дня:
-{chr(10).join(f"  ▪ {f}" for f in data.get('today_focus', ['Следим за рынком']))}
+🔴 Аутсайдеры 24ч:
+{l_lines}
 
-Источник: CoinGecko · Binance · Kraken · Coinbase
+🎯 Что смотреть сегодня:
+{chr(10).join(f"  ▪ {f}" for f in data.get('today_focus', ['Макро-фон спокойный', 'Ждём CPI/FOMC если в графике']))}
+
+⚠️ Главные события этой недели:
+{chr(10).join(f"  ▪ {e}" for e in data.get('week_events', [])) or '  ▪ Календарь спокойный'}
+
+📊 Источники: CoinGecko · Binance · Kraken · Coinbase
+Cross-check: {btc.get('sources_count', '—')} источников согласованы
 """)
 
 
-# === TIGER DAY ===
+# === TIGER OF THE DAY ===
 def tiger_caption(data):
-    """Caption for daily tiger post."""
     t = data["tiger"]
+    direction = "long" if t["bias"] == "long" else "short" if t["bias"] == "short" else "neutral"
+    bias_emoji = {"long": "🟢", "short": "🔴", "neutral": "⚪"}.get(direction, "⚪")
     return textwrap.dedent(f"""\
-🐅 REDDINGTON · Тигр дня
+🏛 REDDINGTON · Тайгер дня | {t['ticker']}
 
-Тикер: {t.get('ticker', '—')}
-Капитализация: {fmt_market_cap(t.get('market_cap'))}
-Доминация: {t.get('dominance', '—')}
+{fmt_price(t['price'])} · {arrow(t['change_24h'])} {fmt_change(t['change_24h'])}
+Cap: {fmt_market_cap(t.get('market_cap'))}
 
-Уровни: {fmt_price(t.get('support'))} / {fmt_price(t.get('resistance'))}
+{bias_emoji} Bias: {direction.upper()}
+Поддержка: {fmt_price(t['support'][0])}–{fmt_price(t['support'][1])}
+Сопротивление: {fmt_price(t['resistance'][0])}–{fmt_price(t['resistance'][1])}
 """)
 
 
 def tiger_body(data):
-    """Body text for daily tiger post."""
     t = data["tiger"]
     return textwrap.dedent(f"""\
-🐅 REDDINGTON · Тигр дня — {t.get('ticker', '—')}
+🏛 REDDINGTON · Тайгер дня · {t['ticker']}
+Почему именно {t['ticker']} сегодня: {t.get('reason', 'Самое сильное движение на рынке')}
 
-Цена: {fmt_price(t.get('price'))} · {arrow(t.get('change_24h'))} {fmt_change(t.get('change_24h'))}
+📊 Состояние:
+{fmt_price(t['price'])} · 24ч {fmt_change(t['change_24h'])} · 7д {fmt_change(t.get('change_7d', 0))}
 Капитализация: {fmt_market_cap(t.get('market_cap'))}
 Доминация: {t.get('dominance', '—')}
-Уровни: support {fmt_price(t.get('support'))} / resistance {fmt_price(t.get('resistance'))}
+
+🔻 Что движет цену:
+{chr(10).join(f"  ▪ {d}" for d in t.get('drivers', ['Нет значимых нарративов']))}
+
+✅ Фундаментал:
+{chr(10).join(f"  ▪ {f}" for f in t.get('fundamentals', ['Нет данных']))}
+
+⚠️ Риски:
+{chr(10).join(f"  ▪ {r}" for r in t.get('risks', ['Рынок нестабилен']))}
+
+🎯 Торговый план:
+  ▪ Зоны: Support {fmt_price(t['support'][0])}–{fmt_price(t['support'][1])} / Resistance {fmt_price(t['resistance'][0])}–{fmt_price(t['resistance'][1])}
+  ▪ Базовый: {t.get('scenarios', {}).get('base', 'Боковик до триггера')}
+  ▪ Бычий: {t.get('scenarios', {}).get('bull', 'Пробой сопротивления с объёмом')}
+  ▪ Медвежий: {t.get('scenarios', {}).get('bear', 'Потеря поддержки → глубокая коррекция')}
+
+🟠 P.S. {t.get('ps', 'Следи за объёмами и реакцией на уровни')}
+
+📬 Вопрос: у кого есть позиция в {t['ticker']} — на каком уровне средняя?
+
+Источники: CoinGecko OHLC · Binance · Kraken · Coinbase
 """)
 
 
 # === ASIAN REVIEW ===
 def asian_caption(data):
-    """Caption for Asian session review."""
-    btc = data.get("btc", {})
-    eth = data.get("eth", {})
     return textwrap.dedent(f"""\
-🌏 REDDINGTON · Азиатский обзор
+🏛 REDDINGTON · Азиатский обзор | {data.get('date_label', '')}
 
-BTC: {fmt_price(btc.get('price', 0))} · {arrow(btc.get('change_24h'))} {fmt_change(btc.get('change_24h'))}
-ETH: {fmt_price(eth.get('price', 0))} · {arrow(eth.get('change_24h'))} {fmt_change(eth.get('change_24h'))}
+BTC: {fmt_price(data['btc']['price'])} · {arrow(data['btc'].get('change_24h'))} {fmt_change(data['btc'].get('change_24h'))}
+ETH: {fmt_price(data['eth'].get('price', 0))} · {fmt_change(data['eth'].get('change_24h', 0))}
+
+Азиатская сессия закрывается
 """)
 
 
 def asian_body(data):
-    """Body for Asian session review."""
-    btc = data.get("btc", {})
-    eth = data.get("eth", {})
-    news = data.get("asia_news", ["Данные обновляются"])
-    flows = data.get("flows", ["Нет данных"])
-    focus = data.get("forward_focus", "Следим за реакцией рынка")
     return textwrap.dedent(f"""\
-🌏 REDDINGTON · Азиатский обзор · {data.get('date_label', '')}
+🏛 REDDINGTON · Азиатский обзор · {data.get('date_label', '')}
 
-📊 Рынок сейчас:
-  ▪ BTC {fmt_price(btc.get('price', 0))} · {fmt_change(btc.get('change_24h'))}
-  ▪ ETH {fmt_price(eth.get('price', 0))} · {fmt_change(eth.get('change_24h'))}
+{data.get('session_focus', '')}
 
-⚡ Азия сегодня:
-{chr(10).join(f"  ▪ {n}" for n in news)}
+📊 Рынок:
+  ▪ BTC {fmt_price(data['btc']['price'])} · {fmt_change(data['btc'].get('change_24h', 0))}
+  ▪ ETH {fmt_price(data['eth'].get('price', 0))} · {fmt_change(data['eth'].get('change_24h', 0))}
+  ▪ Капитализация BTC {fmt_market_cap(data['btc'].get('market_cap'))}
+  ▪ Доминация BTC {data.get('btc_dominance', '—')}
 
-📈 Потоки:
-{chr(10).join(f"  ▪ {fl}" for fl in flows)}
+🟢 Лидеры роста 24ч:
+{chr(10).join(f"  ▪ {m['symbol'].upper()} {fmt_change(m['change'])}" for m in data.get('gainers', [])[:5]) or '  ▪ —'}
 
-🎯 Фокус: {focus}
+🔴 Аутсайдеры 24ч:
+{chr(10).join(f"  ▪ {m['symbol'].upper()} {fmt_change(m['change'])}" for m in data.get('losers', [])[:5]) or '  ▪ —'}
+
+📰 Новости Азии:
+{chr(10).join(f"  ▪ {n}" for n in data.get('asia_news', ['Нет значимых азиатских новостей']))}
+
+💱 Потоки капитала:
+{chr(10).join(f"  ▪ {f}" for f in data.get('flows', ['Данных о крупных потоках нет']))}
+
+🔮 Фокус сессии:
+{chr(10).join(f"  ▪ {f}" for f in data.get('forward_focus', ['Ждём триггера']))}
+
+Источники: CoinGecko · Binance · Kraken · Coinbase
 """)
 
 
 # === WEEKLY PREVIEW ===
 def weekly_caption(data):
-    """Caption for weekly preview."""
-    return textwrap.dedent("""\
-📅 REDDINGTON · Недельный обзор
+    return textwrap.dedent(f"""\
+🏛 REDDINGTON · Недельный обзор | {data.get('date_label', '')}
 
-События недели и ориентиры
+{data.get('theme', 'Рынок в боковике — ждём катализатора')}
+
+🔑 Уровни BTC: {fmt_price(data['btc']['support'][0])}–{fmt_price(data['btc']['resistance'][1])}
 """)
 
 
 def weekly_body(data):
-    """Body for weekly preview."""
-    events = data.get("events", [])
-    levels = data.get("levels", {})
+    btc = data["btc"]
+    sectors = data.get("sectors", {})
     return textwrap.dedent(f"""\
-📅 REDDINGTON · Недельный обзор · {data.get('week_label', '')}
+🏛 REDDINGTON · Недельный обзор · {data.get('date_label', '')}
 
-🗓 Ключевые события:
-{chr(10).join(f"  ▪ {e}" for e in events) or "  ▪ Нет значимых событий"}
+{data.get('theme', 'Неделя без явного нарратива')}
 
-📊 Ориентиры:
-  ▪ BTC support {fmt_price(levels.get('btc_support', 0))} / resistance {fmt_price(levels.get('btc_resistance', 0))}
-  ▪ ETH support {fmt_price(levels.get('eth_support', 0))} / resistance {fmt_price(levels.get('eth_resistance', 0))}
+📅 Ключевые события недели:
+{chr(10).join(f"  ▪ {e}" for e in data.get('week_events', [])) or '  ▪ Календарь спокойный'}
 
-Фокус: {data.get('focus', 'Следим за неделей')}
+📊 Секторы:
+{chr(10).join(f"  ▪ {s}: {fmt_change(sectors.get(s, {}).get('change', 0))}" for s in ['L1', 'L2', 'DeFi', 'AI', 'RWA', 'Memes', 'GameFi'])}
+
+🎯 Топ-7 альтов на неделю:
+{chr(10).join(f"  ▪ {a['symbol'].upper()} {fmt_change(a['change'])} — {a.get('reason', '')}" for a in data.get('top_alts', [])[:7]) or '  ▪ —'}
+
+⚠️ Риски недели:
+{chr(10).join(f"  ▪ {r}" for r in data.get('risks', ['Нет явных рисков']))}
+
+📊 Источники: CoinGecko · Binance · Kraken · Coinbase
 """)
 
 
-def alert_text(title, lines):
-    """Compact alert text for Telegram."""
-    body = "\n".join(f"  ▪ {l}" for l in lines)
+# === ALERTS ===
+def alert_text(data):
     return textwrap.dedent(f"""\
-🚨 REDDINGTON · {title}
+🚨 REDDINGTON · АЛЕРТ
 
-{body}
+{emoji}{ticker}: {fmt_price(price)} · {fmt_change(change_24h)}
+
+{reason}
+
+⏰ {timestamp}
 """)
+
+
+def fmt_data_summary(data):
+    """Compact one-line summary used by caption."""
+    btc = data.get("btc", {})
+    return {
+        "btc_price": fmt_price(btc.get("price")),
+        "btc_change": fmt_change(btc.get("change_24h")),
+        "btc_dominance": data.get("btc_dominance", "—"),
+    }
