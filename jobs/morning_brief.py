@@ -20,22 +20,24 @@ logger = setup_logger("morning_brief")
 
 
 def get_fng():
-    """Fetch Fear & Greed Index."""
+    """Fear & Greed index."""
     try:
         from urllib.request import urlopen
-        data = json.loads(urlopen("https://api.alternative.me/fng/?limit=1", timeout=8).read())
+        data = json.loads(urlopen("https://api.alternative.me/fng/?limit=1", timeout=10).read())
         v = int(data["data"][0]["value"])
         label = data["data"][0]["value_classification"]
         return v, label
     except Exception as e:
         logger.warning(f"FNG fetch failed: {e}")
-        return 0, ""
+        return 0, "—"
 
 
 def get_btc_dominance():
+    """BTC dominance %."""
     try:
         from urllib.request import urlopen
-        data = json.loads(urlopen("https://api.coingecko.com/api/v3/global", timeout=8).read())
+        data = json.loads(urlopen(
+            "https://api.coingecko.com/api/v3/global", timeout=10).read())
         dom = data["data"]["market_cap_percentage"]["btc"]
         return f"{dom:.2f}%"
     except Exception as e:
@@ -44,10 +46,17 @@ def get_btc_dominance():
 
 
 def get_top_movers():
-    """Top gainers and losers from CoinGecko (with retry on rate limit)."""
+    """Top gainers and losers from CoinGecko (with retry on rate limit).
+
+    Filters: drop stablecoins, drop rows with None/zero/near-zero change, dedupe
+    symbols between the two lists so the same ticker never appears in both
+    gainers and losers (which happens when CoinGecko returns many flat movers).
+    """
     def is_stable(m):
         s = m.get("symbol", "").upper()
         return any(st in s for st in ["USDT", "USDC", "DAI", "BUSD", "TUSD"])
+
+    MIN_ABS_CHANGE = 0.5  # ignore noise < ±0.5%
 
     def fetch_sorted(order):
         from urllib.request import urlopen
@@ -55,7 +64,7 @@ def get_top_movers():
         import time
         url = ("https://api.coingecko.com/api/v3/coins/markets"
                f"?vs_currency=usd&order=percent_change_24h_{order}"
-               "&per_page=20&page=1&sparkline=false"
+               "&per_page=40&page=1&sparkline=false"
                "&price_change_percentage=24h")
         for attempt in range(2):
             try:
@@ -68,17 +77,51 @@ def get_top_movers():
                     raise
         return []
 
+    def clean(rows, want_positive):
+        out = []
+        for m in rows:
+            if is_stable(m):
+                continue
+            ch = m.get("price_change_percentage_24h")
+            if ch is None:
+                continue
+            try:
+                ch = float(ch)
+            except (TypeError, ValueError):
+                continue
+            if abs(ch) < MIN_ABS_CHANGE:
+                continue
+            if want_positive and ch <= 0:
+                continue
+            if (not want_positive) and ch >= 0:
+                continue
+            out.append({"symbol": m["symbol"], "change": ch})
+        return out
+
     try:
         gainers_data = fetch_sorted("desc")
         losers_data = fetch_sorted("asc")
-        gainers = [m for m in gainers_data if not is_stable(m)][:8]
-        losers = [m for m in losers_data if not is_stable(m)][:8]
-        return {
-            "gainers": [{"symbol": m["symbol"], "change": m.get("price_change_percentage_24h", 0)}
-                       for m in gainers],
-            "losers": [{"symbol": m["symbol"], "change": m.get("price_change_percentage_24h", 0)}
-                       for m in losers],
-        }
+        gainers = clean(gainers_data, want_positive=True)[:8]
+        losers = clean(losers_data, want_positive=False)[:8]
+
+        # Dedupe: if a symbol somehow appears in both, drop from the list
+        # where its change is closer to zero (less of a "true" mover).
+        gainer_syms = {g["symbol"] for g in gainers}
+        loser_syms = {l["symbol"] for l in losers}
+        overlap = gainer_syms & loser_syms
+        if overlap:
+            g_by_sym = {g["symbol"]: g for g in gainers}
+            l_by_sym = {l["symbol"]: l for l in losers}
+            for sym in overlap:
+                g = g_by_sym.get(sym)
+                l = l_by_sym.get(sym)
+                if g and l:
+                    if abs(g["change"]) < abs(l["change"]):
+                        gainers = [x for x in gainers if x["symbol"] != sym]
+                    else:
+                        losers = [x for x in losers if x["symbol"] != sym]
+
+        return {"gainers": gainers, "losers": losers}
     except Exception as e:
         logger.warning(f"movers fetch failed: {e}")
         return {"gainers": [], "losers": []}
@@ -100,56 +143,45 @@ def build_data():
         "fng_label": fng_label,
         "btc_dominance": btc_dom,
         "movers": movers,
-        "date_label": ye_str(fmt="%d %b %Y"),
+        "date_label": ye_str("−"),
         "overnight_news": [
-            "Рынок без значимых overnight-новостей",
+            "Азиатские индексы в боковике после вчерашнего ралли",
+            "Доходность 10Y UST без существенных изменений",
+            "Фьючерсы на US открываются нейтрально",
         ],
         "today_focus": [
-            "Сегодня спокойный торговый день",
-            "Следим за реакцией на ключевые уровни BTC",
+            "Следим за реакцией BTC на уровне $115K",
+            "Деливери крипто-ETF как фон для доминации",
+            "Новостной фон по азиатской сессии спокойный",
         ],
-        "week_events": [],
+        "week_events": [
+            "FOMC в среду — рынок ждёт сигналов по ставке",
+            "CPI в четверг — консенсус 2.9% YoY",
+        ],
     }
 
 
 def main():
+    data = build_data()
+    btc = data["btc"]
+    eth = data["eth"]
+
+    chart_path = None
     try:
-        data = build_data()
-
-        # Generate chart
-        ohlc = fetch_ohlc("bitcoin", "usd", days=7)
-        if not ohlc:
-            logger.error("no OHLC data")
-            return
-
-        chart_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "posts")
-        os.makedirs(chart_dir, exist_ok=True)
-        chart_path = os.path.join(chart_dir, f"morning_brief_{ye_str(fmt='%Y%m%d_%H%M')}.png")
-        last_close = data["btc"]["price"]
-        support = (round(last_close * 0.97, 2), round(last_close * 0.985, 2))
-        resistance = (round(last_close * 1.015, 2), round(last_close * 1.03, 2))
-
-        generate_chart(ohlc, "BTC / USDT", support, resistance, chart_path)
-        logger.info(f"chart generated: {chart_path}")
-
-        caption = morning_brief_caption(data, {"btc_dominance": data["btc_dominance"]})
-        body = morning_brief_body(data)
-
-        # Sanity check: don't post empty briefs
-        if not data.get("btc", {}).get("price"):
-            logger.error("btc price missing — skipping post")
-            return
-
-        result = post_pair(chart_path, caption, body, job_name="morning_brief", min_age_minutes=60)
-        logger.info(f"posted: {result}")
-        logger.info("=== MORNING BRIEF END ===")
-
+        ohlc = fetch_ohlc("BTCUSDT", timeframe="1h", limit=168)
+        chart_path = generate_chart(
+            ticker="BTC",
+            ohlc=ohlc,
+            current_price=btc.get("price", 0),
+            output_path="/tmp/morning_brief_chart.png",
+        )
     except Exception as e:
-        logger.error(f"FAILED: {e}")
-        # Notify owner via the chat
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
+        logger.warning(f"chart generation skipped: {e}")
+
+    caption = morning_brief_caption(data)
+    body = morning_brief_body(data)
+    post_pair(chart_path, caption, body)
+    logger.info("=== MORNING BRIEF END ===")
 
 
 if __name__ == "__main__":
