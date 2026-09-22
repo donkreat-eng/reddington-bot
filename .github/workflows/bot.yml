@@ -1,25 +1,20 @@
 name: Reddington Bot
 
 on:
-  # Morning brief — Mon-Fri 04:00 UTC = 09:00 YEKT
   schedule:
-    - cron: '0 4 * * 1-5'
-    # Market overview (Top-5 + Metals) — Mon-Fri 08:30 UTC = 13:30 YEKT
-    - cron: '30 8 * * 1-5'
-    # Tiger day — Mon-Fri 09:45 UTC = 14:45 YEKT
-    - cron: '45 9 * * 1-5'
-    # Asian review — Mon-Fri 11:15 UTC = 16:15 YEKT
-    - cron: '15 11 * * 1-5'
-    # Weekly preview — Sunday 15:00 UTC = 20:00 YEKT
-    - cron: '0 15 * * 0'
-
+    # UTC -> Yekaterinburg (UTC+5)
+    - cron: '0 4 * * 1-5'   # 04:00 UTC = 09:00 YEKT Mon-Fri -> morning_brief
+    - cron: '30 8 * * 1-5'  # 08:30 UTC = 13:30 YEKT Mon-Fri -> market_overview
+    - cron: '45 9 * * 1-5'  # 09:45 UTC = 14:45 YEKT Mon-Fri -> tiger_day
+    - cron: '15 11 * * 1-5' # 11:15 UTC = 16:15 YEKT Mon-Fri -> asian_review
+    - cron: '0 15 * * 0'    # 15:00 UTC = 20:00 YEKT Sun -> weekly_preview
   workflow_dispatch:
     inputs:
       job:
-        description: 'Job to run (optional, auto-detected if empty)'
+        description: 'Which job to run (or empty for auto-detect by UTC time)'
         required: false
-        default: ''
         type: choice
+        default: ''
         options:
           - ''
           - morning_brief
@@ -31,12 +26,18 @@ on:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+    env:
+      REDDINGTON_BOT_TOKEN: ${{ secrets.REDDINGTON_BOT_TOKEN }}
+      REDDINGTON_CHANNEL_ID: ${{ secrets.REDDINGTON_CHANNEL_ID }}
+      REDDINGTON_CHANNEL_NAME: 'Reddington Trade'
     steps:
+      - name: Set up job
+        run: echo "post job starting"
+
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -44,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests matplotlib numpy pillow
 
       - name: Setup env
         run: |
@@ -54,7 +55,7 @@ jobs:
 
       - name: Run job
         env:
-          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB: ${{ inputs.job || 'auto' }}
         run: |
           # Determine which job to run based on time (or manual override)
           INPUT_JOB="${{ inputs.job }}"
@@ -68,17 +69,17 @@ jobs:
 
             JOB="none"
             if [ "$WD" -ge 1 ] && [ "$WD" -le 5 ]; then
-              if [ "$HOUR" = "04" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
+              if [ "$HOUR" = "04" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "60" ]; then
                 JOB="morning_brief"
-              elif [ "$HOUR" = "08" ] && [ "$MIN" -ge "30" ] && [ "$MIN" -lt "40" ]; then
+              elif [ "$HOUR" = "08" ] && [ "$MIN" -ge "30" ] && [ "$MIN" -lt "60" ]; then
                 JOB="market_overview"
-              elif [ "$HOUR" = "09" ] && [ "$MIN" -ge "45" ] && [ "$MIN" -lt "55" ]; then
+              elif [ "$HOUR" = "09" ] && [ "$MIN" -ge "45" ] && [ "$MIN" -lt "60" ]; then
                 JOB="tiger_day"
-              elif [ "$HOUR" = "11" ] && [ "$MIN" -ge "15" ] && [ "$MIN" -lt "25" ]; then
+              elif [ "$HOUR" = "11" ] && [ "$MIN" -ge "15" ] && [ "$MIN" -lt "60" ]; then
                 JOB="asian_review"
               fi
             elif [ "$WD" = "7" ]; then
-              if [ "$HOUR" = "15" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "10" ]; then
+              if [ "$HOUR" = "15" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "60" ]; then
                 JOB="weekly_preview"
               fi
             fi
