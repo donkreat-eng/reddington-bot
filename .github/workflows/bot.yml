@@ -1,110 +1,91 @@
 name: Reddington Bot
 
 on:
-  # Morning brief — Mon-Fri 04:00 UTC = 09:00 YEKT
+  # Market overview (Top-5 + Metals) — Mon-Fri 08:30 UTC = 13:30 YEKT
   schedule:
-    - cron: '0 4 * * 1-5'
-    # Market overview — Mon-Fri 08:30 UTC = 13:30 YEKT
     - cron: '30 8 * * 1-5'
     # Tiger day — Mon-Fri 09:45 UTC = 14:45 YEKT
     - cron: '45 9 * * 1-5'
     # Asian review — Mon-Fri 11:15 UTC = 16:15 YEKT
     - cron: '15 11 * * 1-5'
-    # Weekly preview — Sun 15:00 UTC = 20:00 YEKT
+    # Weekly preview — Sunday 15:00 UTC = 20:00 YEKT
     - cron: '0 15 * * 0'
 
   workflow_dispatch:
     inputs:
       job:
-        description: 'Which job to run (or empty for auto-detect by UTC time)'
+        description: 'Job to run (optional, auto-detected if empty)'
         required: false
+        default: ''
         type: choice
         options:
           - ''
-          - morning_brief
           - market_overview
           - tiger_day
           - asian_review
           - weekly_preview
-          - fix_morning_brief
 
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    env:
-      REDDINGTON_BOT_TOKEN: ${{ secrets.REDDINGTON_BOT_TOKEN }}
-      REDDINGTON_CHANNEL_ID: ${{ secrets.REDDINGTON_CHANNEL_ID }}
-      REDDINGTON_CHANNEL_NAME: 'Reddington Trade'
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up job
-        run: echo "post job starting"
-
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run cron watchdog guard
+      - name: Setup env
         run: |
-          # Only skip Mon-Fri 09:45 YEKT + Sun 15:00 YEKT to avoid races with explicit schedule + dispatch
-          WD=$(date -u +%u)
-          HOUR=$(date -u +%H)
-          MIN=$(date -u +%M)
-          echo "UTC time $HOUR:$MIN weekday=$WD"
+          echo "REDDINGTON_BOT_TOKEN=${{ secrets.REDDINGTON_BOT_TOKEN }}" >> $GITHUB_ENV
+          echo "REDDINGTON_CHANNEL_ID=${{ secrets.REDDINGTON_CHANNEL_ID }}" >> $GITHUB_ENV
+          echo "REDDINGTON_CHANNEL_NAME=Reddington Trade" >> $GITHUB_ENV
 
       - name: Run job
         env:
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          INPUT_JOB: ${{ inputs.job }}
         run: |
-          set -euo pipefail
-          WD=$(date -u +%u)
-          HOUR=$(date -u +%H)
-          MIN=$(date -u +%M)
-          JOB="$INPUT_JOB"
-          if [ -z "$JOB" ]; then
-            if [ "$WD" -ge "1" ] && [ "$WD" -le "5" ]; then
-              if [ "$HOUR" = "04" ] && [ "$MIN" -lt "60" ]; then
-                JOB="morning_brief"
-              elif [ "$HOUR" = "08" ] && [ "$MIN" -lt "60" ]; then
+          # Determine which job to run based on time (or manual override)
+          INPUT_JOB="${{ inputs.job }}"
+          if [ -n "$INPUT_JOB" ]; then
+            JOB="$INPUT_JOB"
+          else
+            HOUR=$(date -u +%H)
+            MIN=$(date -u +%M)
+            WD=$(date -u +%u)  # 1=Mon..7=Sun
+            echo "UTC time: ${HOUR}:${MIN}, weekday: ${WD}"
+
+            JOB="none"
+            # 1-hour windows so cron-watchdog (15-min cadence) reliably hits the slot
+            if [ "$WD" -ge 1 ] && [ "$WD" -le 5 ]; then
+              if [ "$HOUR" = "08" ] && [ "$MIN" -ge "30" ] && [ "$MIN" -lt "60" ]; then
                 JOB="market_overview"
-              elif [ "$HOUR" = "09" ] && [ "$MIN" -lt "60" ]; then
+              elif [ "$HOUR" = "09" ] && [ "$MIN" -ge "45" ] && [ "$MIN" -lt "60" ]; then
                 JOB="tiger_day"
-              elif [ "$HOUR" = "11" ] && [ "$MIN" -lt "60" ]; then
+              elif [ "$HOUR" = "11" ] && [ "$MIN" -ge "15" ] && [ "$MIN" -lt "60" ]; then
                 JOB="asian_review"
               fi
-            fi
-            if [ "$WD" = "7" ] && [ "$HOUR" = "15" ] && [ "$MIN" -lt "60" ]; then
-              JOB="weekly_preview"
-            fi
-            if [ -z "$JOB" ]; then
-              JOB="none"
+            elif [ "$WD" = "7" ]; then
+              if [ "$HOUR" = "15" ] && [ "$MIN" -ge "0" ] && [ "$MIN" -lt "60" ]; then
+                JOB="weekly_preview"
+              fi
             fi
           fi
-          echo "JOB=$JOB"
+
+          echo "running job: ${JOB}"
+          mkdir -p posts logs
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE:-.}"
           if [ "$JOB" = "none" ]; then
             echo "no scheduled job for this UTC time — skipping"
             exit 0
           fi
-          mkdir -p posts logs
           python jobs/${JOB}.py 2>&1 | tee logs/${JOB}_run.log
-
-      - name: Notify completion
-        if: always()
-        run: echo "post job done"
-
-      - name: Post-job cleanup
-        if: always()
-        run: echo "cleanup step"
-
-      - name: Final log
-        if: always()
-        run: echo "final log step"
