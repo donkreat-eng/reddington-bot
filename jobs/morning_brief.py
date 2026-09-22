@@ -20,24 +20,22 @@ logger = setup_logger("morning_brief")
 
 
 def get_fng():
-    """Fear & Greed index."""
+    """Fetch Fear & Greed Index."""
     try:
         from urllib.request import urlopen
-        data = json.loads(urlopen("https://api.alternative.me/fng/?limit=1", timeout=10).read())
+        data = json.loads(urlopen("https://api.alternative.me/fng/?limit=1", timeout=8).read())
         v = int(data["data"][0]["value"])
         label = data["data"][0]["value_classification"]
         return v, label
     except Exception as e:
         logger.warning(f"FNG fetch failed: {e}")
-        return 0, "—"
+        return 0, ""
 
 
 def get_btc_dominance():
-    """BTC dominance %."""
     try:
         from urllib.request import urlopen
-        data = json.loads(urlopen(
-            "https://api.coingecko.com/api/v3/global", timeout=10).read())
+        data = json.loads(urlopen("https://api.coingecko.com/api/v3/global", timeout=8).read())
         dom = data["data"]["market_cap_percentage"]["btc"]
         return f"{dom:.2f}%"
     except Exception as e:
@@ -143,45 +141,43 @@ def build_data():
         "fng_label": fng_label,
         "btc_dominance": btc_dom,
         "movers": movers,
-        "date_label": ye_str("−"),
+        "date_label": ye_str(fmt="%d %b %Y"),
         "overnight_news": [
-            "Азиатские индексы в боковике после вчерашнего ралли",
-            "Доходность 10Y UST без существенных изменений",
-            "Фьючерсы на US открываются нейтрально",
+            "Рынок без значимых overnight-новостей",
         ],
         "today_focus": [
-            "Следим за реакцией BTC на уровне $115K",
-            "Деливери крипто-ETF как фон для доминации",
-            "Новостной фон по азиатской сессии спокойный",
+            "Сегодня спокойный торговый день",
+            "Следим за реакцией на ключевые уровни BTC",
         ],
-        "week_events": [
-            "FOMC в среду — рынок ждёт сигналов по ставке",
-            "CPI в четверг — консенсус 2.9% YoY",
-        ],
+        "week_events": [],
     }
 
 
 def main():
-    data = build_data()
-    btc = data["btc"]
-    eth = data["eth"]
-
-    chart_path = None
     try:
-        ohlc = fetch_ohlc("BTCUSDT", timeframe="1h", limit=168)
-        chart_path = generate_chart(
-            ticker="BTC",
-            ohlc=ohlc,
-            current_price=btc.get("price", 0),
-            output_path="/tmp/morning_brief_chart.png",
-        )
-    except Exception as e:
-        logger.warning(f"chart generation skipped: {e}")
+        data = build_data()
 
-    caption = morning_brief_caption(data)
-    body = morning_brief_body(data)
-    post_pair(chart_path, caption, body)
-    logger.info("=== MORNING BRIEF END ===")
+        # Generate chart
+        ohlc = fetch_ohlc("bitcoin", "usd", days=7)
+        if not ohlc:
+            logger.error("no OHLC data")
+            return
+
+        chart_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "posts")
+        os.makedirs(chart_dir, exist_ok=True)
+        chart_path = os.path.join(chart_dir, f"morning_brief_{ye_str(fmt='%Y%m%d_%H%M')}.png")
+        last_close = data["btc"]["price"] if data.get("btc") else None
+        generate_chart(ohlc, chart_path, last_price=last_close)
+
+        caption = morning_brief_caption(data)
+        body = morning_brief_body(data)
+        result = post_pair(chart_path, caption, body)
+        logger.info(f"posted: {result}")
+    except Exception as e:
+        logger.error(f"main failed: {e}")
+        raise
+    finally:
+        logger.info("=== MORNING BRIEF END ===")
 
 
 if __name__ == "__main__":
